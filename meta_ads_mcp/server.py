@@ -211,10 +211,29 @@ else:
 
 
 def main():
-    """Run the MCP server via stdio transport."""
+    """Run the MCP server.
+
+    Transport is controlled by the MCP_TRANSPORT env var:
+      - streamable-http (default) — modern HTTP transport, recommended for remote deployments
+      - sse                       — legacy Server-Sent Events HTTP transport
+      - stdio                     — local stdio transport for Claude Desktop / CLI
+
+    HTTP-specific env vars (ignored for stdio):
+      MCP_HOST  — bind address (default: 0.0.0.0)
+      MCP_PORT  — bind port    (default: 8000)
+    """
+    import os
+    transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
     mode = "premium (98 tools)" if PREMIUM_AVAILABLE else "open-core (55 tools)"
-    logger.info("Starting KonQuest Meta Ads MCP server v%s [%s]", "2.0.0", mode)
-    mcp.run(transport="stdio")
+    logger.info("Starting KonQuest Meta Ads MCP server v%s [%s] transport=%s", "2.0.0", mode, transport)
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("MCP_PORT", "8000"))
+        logger.info("Listening on %s:%s", host, port)
+        mcp.run(transport=transport, host=host, port=port)
 
 
 if __name__ == "__main__":
