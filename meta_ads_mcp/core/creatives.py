@@ -15,6 +15,7 @@ import logging
 from typing import Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format
 
@@ -207,7 +208,7 @@ def _extract_media_urls(creative: dict, account_id: Optional[str] = None) -> dic
     return media
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_ad_creatives(
     account_id: str,
     ad_id: Optional[str] = None,
@@ -291,7 +292,7 @@ def get_ad_creatives(
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_creative_details(
     creative_id: str,
     account_id: Optional[str] = None,
@@ -378,7 +379,7 @@ VALID_CTA_TYPES = [
 ]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def create_ad_creative(
     account_id: str,
     page_id: str,
@@ -594,7 +595,7 @@ def create_ad_creative(
 # To change ad copy, create a NEW creative via create_ad_creative, then swap
 # it on the ad via update_ad(creative_id=new_id).
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
 def update_ad_creative(
     creative_id: str,
     name: Optional[str] = None,

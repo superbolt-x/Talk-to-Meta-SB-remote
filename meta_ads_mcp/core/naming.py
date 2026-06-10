@@ -24,6 +24,7 @@ import logging
 from typing import Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 
 logger = logging.getLogger("meta-ads-mcp.naming")
 
@@ -143,7 +144,7 @@ def validate_name(name: str, object_type: str) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def generate_names(
     object_type: str,
     objective: Optional[str] = None,

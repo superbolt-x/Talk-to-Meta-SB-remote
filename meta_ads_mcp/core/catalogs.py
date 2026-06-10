@@ -13,6 +13,7 @@ import logging
 from typing import Any, Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format
 
@@ -25,7 +26,7 @@ SEVERITY_LOW = "LOW"
 SEVERITY_INFO = "INFO"
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_catalog_info(catalog_id: str) -> dict:
     """
     Get catalog details including product count, vertical, name,
@@ -82,7 +83,7 @@ def get_catalog_info(catalog_id: str) -> dict:
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_catalog_products(
     catalog_id: str,
     limit: int = 25,
@@ -166,7 +167,7 @@ def get_catalog_products(
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_product_sets(catalog_id: str) -> dict:
     """
     List product sets in a catalog with product counts and filter rules.
@@ -200,7 +201,7 @@ def get_product_sets(catalog_id: str) -> dict:
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def validate_catalog_connections(
     catalog_id: str,
     account_id: Optional[str] = None,
@@ -465,7 +466,7 @@ def validate_catalog_connections(
 
 # --- Convenience Gap: Product Set Create/Update ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def create_product_set(
     catalog_id: str,
     name: str,
@@ -515,7 +516,7 @@ def create_product_set(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
 def update_product_set(
     product_set_id: str,
     name: Optional[str] = None,

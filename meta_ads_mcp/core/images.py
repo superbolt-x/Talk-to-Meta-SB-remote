@@ -10,6 +10,7 @@ from typing import Optional
 import httpx
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError, GRAPH_API_BASE
 from meta_ads_mcp.core.utils import ensure_account_id_format
 
@@ -18,7 +19,7 @@ logger = logging.getLogger("meta-ads-mcp.images")
 MAX_IMAGE_SIZE_BYTES = 30_000_000  # 30MB Meta limit
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def upload_ad_image(
     account_id: str,
     image_url: str,
@@ -174,7 +175,7 @@ def upload_ad_image(
 
 # --- Convenience Gap: Image Retrieval ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_ad_image(
     account_id: str,
     image_hash: str,

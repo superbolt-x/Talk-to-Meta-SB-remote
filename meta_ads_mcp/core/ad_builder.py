@@ -15,6 +15,7 @@ from typing import Any, Optional
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 
 logger = logging.getLogger("meta-ads-mcp.ad_builder")
 
@@ -151,7 +152,7 @@ def generate_ad_name(pattern: dict, hook: str, format_label: str, version: str =
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def create_multi_asset_ad(
     account_id: str,
     adset_id: str,
@@ -236,11 +237,7 @@ def create_multi_asset_ad(
 
     api_client._ensure_initialized()
 
-    # --- Vault gate ---
-    from meta_ads_mcp.core.vault_reader import enforce_vault_gate
-    vault_error, vault_ctx = enforce_vault_gate(account_id, "create_multi_asset_ad")
-    if vault_error:
-        return vault_error
+    vault_ctx = {}
 
     # ============================================================
     # 0.5 AUTO/HYBRID COPY GENERATION

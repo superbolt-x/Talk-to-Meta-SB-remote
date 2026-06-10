@@ -13,13 +13,14 @@ from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.exceptions import FacebookRequestError
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.auth import verify_token_and_permissions
 
 logger = logging.getLogger("meta-ads-mcp.accounts")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def check_token_status() -> dict:
     """
     Check Meta API token health, permissions, and rate limit status.
@@ -30,7 +31,7 @@ def check_token_status() -> dict:
     return verify_token_and_permissions()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_ad_accounts(limit: int = 50) -> dict:
     """
     List all ad accounts accessible to the authenticated user.
@@ -83,7 +84,7 @@ def get_ad_accounts(limit: int = 50) -> dict:
         raise api_client.handle_sdk_error(e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_account_info(account_id: str) -> dict:
     """
     Get detailed information about a specific ad account.
@@ -138,7 +139,7 @@ def get_account_info(account_id: str) -> dict:
         raise api_client.handle_sdk_error(e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_account_pages(account_id: str) -> dict:
     """
     List Facebook Pages available for ads on a specific ad account.
@@ -169,7 +170,7 @@ def get_account_pages(account_id: str) -> dict:
         raise api_client.handle_sdk_error(e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_instagram_identities(account_id: str) -> dict:
     """
     List Instagram accounts available for ads on a specific ad account.
@@ -210,7 +211,7 @@ def get_instagram_identities(account_id: str) -> dict:
         raise api_client.handle_sdk_error(e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def discover_all_accounts() -> dict:
     """
     Discover all ad accounts, their pages, pixels, and Instagram accounts.

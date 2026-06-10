@@ -32,6 +32,7 @@ from datetime import datetime
 from typing import Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format, format_budget_cents_to_currency, currency_to_cents
 
@@ -67,7 +68,7 @@ ADSET_DETAIL_FIELDS = ADSET_LIST_FIELDS + [
 ]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_adsets(
     account_id: str,
     campaign_id: Optional[str] = None,
@@ -153,7 +154,7 @@ def get_adsets(
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_adset_details(adset_id: str) -> dict:
     """
     Get detailed ad set information including targeting, optimization,
@@ -223,7 +224,7 @@ def _detect_budget_model(campaign: dict) -> tuple[str, str]:
         return "ABO", "Campaign has no budget. Ad sets must provide their own daily_budget or lifetime_budget."
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def create_adset(
     account_id: str,
     campaign_id: str,
@@ -281,11 +282,7 @@ def create_adset(
     account_id = ensure_account_id_format(account_id)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # --- Vault gate ---
-    from meta_ads_mcp.core.vault_reader import enforce_vault_gate
-    vault_error, vault_ctx = enforce_vault_gate(account_id, "create_adset")
-    if vault_error:
-        return vault_error
+    vault_ctx = {}
 
     # ============================================================
     # Step 0: Input validation (hard gates)
@@ -858,7 +855,7 @@ def create_adset(
 
 # --- Phase C.2: Ad set update ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
 def update_adset(
     adset_id: str,
     name: Optional[str] = None,

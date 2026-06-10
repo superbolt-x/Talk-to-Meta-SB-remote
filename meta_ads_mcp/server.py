@@ -43,7 +43,7 @@ from meta_ads_mcp.core import video  # noqa: E402, F401
 from meta_ads_mcp.core import naming  # noqa: E402, F401
 from meta_ads_mcp.core import ad_builder  # noqa: E402, F401
 from meta_ads_mcp.core import ops  # noqa: E402, F401
-from meta_ads_mcp.core import vault_reader  # noqa: E402, F401
+# vault_reader removed — no marketing-vault dependency in this deployment
 from meta_ads_mcp.core import duplication  # noqa: E402, F401
 
 # --- Setup & Readiness ---
@@ -62,7 +62,7 @@ if PREMIUM_AVAILABLE:
     # --- Premium Core Modules ---
     from meta_ads_mcp.core import copy_engine  # noqa: E402, F401
     from meta_ads_mcp.core import automation  # noqa: E402, F401
-    from meta_ads_mcp.core import vault_bootstrap  # noqa: E402, F401
+    # vault_bootstrap removed — no marketing-vault dependency in this deployment
 
     # --- Premium Engine: Decision & Optimization ---
     def _register_engine_tools():

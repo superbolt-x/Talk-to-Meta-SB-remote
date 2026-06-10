@@ -12,6 +12,7 @@ import logging
 from typing import Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format
 
@@ -35,7 +36,7 @@ def _format_audience_size(lower: int, upper: int) -> str:
     return f"{_fmt(lower)}-{_fmt(upper)}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def search_interests(
     query: str,
     limit: int = 20,
@@ -96,7 +97,7 @@ def search_interests(
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def search_behaviors(
     query: Optional[str] = None,
     limit: int = 30,
@@ -151,7 +152,7 @@ def search_behaviors(
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def search_geo_locations(
     query: str,
     location_type: str = "country",
@@ -219,7 +220,7 @@ def search_geo_locations(
 # --- Wave 1.1: Targeting Parity ---
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_interest_suggestions(
     interest_list: str,
     limit: int = 20,
@@ -275,7 +276,7 @@ def get_interest_suggestions(
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def search_demographics(
     query: Optional[str] = None,
     limit: int = 30,
@@ -333,7 +334,7 @@ def search_demographics(
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def estimate_audience_size(
     account_id: str,
     targeting_json: str,

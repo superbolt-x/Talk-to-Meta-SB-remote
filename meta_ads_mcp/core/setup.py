@@ -11,13 +11,14 @@ import os
 from pathlib import Path
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError, GRAPH_API_VERSION
 from meta_ads_mcp.core.utils import ensure_account_id_format
 
 logger = logging.getLogger("meta-ads-mcp.setup")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def run_setup_check() -> dict:
     """
     Check MCP setup readiness and return structured results.
@@ -53,20 +54,7 @@ def run_setup_check() -> dict:
     else:
         checks.append(_check("app_secret", "pass", "META_APP_SECRET is set.", scope="global"))
 
-    # A3: VAULT_PATH (required for write operations - campaign/ad creation/update)
-    vault_path = os.environ.get("VAULT_PATH", "")
-    vault_available = False
-    if not vault_path:
-        checks.append(_check("vault_path", "fail", "VAULT_PATH not set. Required for campaign/ad creation and updates. Set VAULT_PATH to a directory path. Then run bootstrap_client_vault for each client.", scope="global"))
-        fix_instructions.append("Set VAULT_PATH environment variable to a directory path (e.g., /Users/you/marketing-vault or C:\\Users\\you\\marketing-vault). Then run bootstrap_client_vault for each client account.")
-    elif not Path(vault_path).is_dir():
-        checks.append(_check("vault_path", "fail", f"VAULT_PATH set to '{vault_path}' but directory does not exist. Create it or fix the path.", scope="global"))
-        fix_instructions.append(f"Create directory: mkdir -p {vault_path}")
-    else:
-        checks.append(_check("vault_path", "pass", f"VAULT_PATH set and exists: {vault_path}", scope="global"))
-        vault_available = True
-
-    # A4: accounts.yaml
+    # A3: accounts.yaml
     config_dir = Path(__file__).parent.parent.parent / "config"
     accounts_yaml = config_dir / "accounts.yaml"
     if not accounts_yaml.exists():
@@ -194,62 +182,6 @@ def run_setup_check() -> dict:
                 checks.append(_check(f"{acct_id}_pixel", "warn", "No pixel found. Tracking diagnostics and conversion optimization will be limited.", scope=acct_scope))
         except MetaAPIError:
             checks.append(_check(f"{acct_id}_pixel", "warn", "Could not check pixels.", scope=acct_scope))
-
-        # Vault readiness per account
-        if vault_available:
-            from meta_ads_mcp.engine.storage import resolve_slug
-            slug = resolve_slug(acct_id)
-            if not slug:
-                checks.append(_check(f"{acct_id}_vault", "fail",
-                    "No client slug in accounts.yaml. Write operations will be blocked. Run bootstrap_client_vault after registering this account.",
-                    scope=acct_scope))
-            else:
-                client_dir = Path(vault_path) / "01_CLIENTS" / slug
-                if not client_dir.exists():
-                    checks.append(_check(f"{acct_id}_vault", "fail",
-                        f"Vault directory missing: 01_CLIENTS/{slug}/. Run bootstrap_client_vault with account_id='{acct_id}' to create it.",
-                        scope=acct_scope))
-                else:
-                    profile = client_dir / "00-profile.md"
-                    voice = client_dir / "04-brand-voice.md"
-                    icps = client_dir / "02-icp-personas.md"
-                    has_profile = profile.exists() and profile.stat().st_size > 50
-                    has_voice = voice.exists() and voice.stat().st_size > 50
-                    has_icps = icps.exists() and icps.stat().st_size > 50
-                    important_count = sum(1 for f in ["05-messaging-house.md", "08-objections.md", "03-offers.md", "01-positioning.md", "matrix.md"]
-                                          if (client_dir / f).exists() and (client_dir / f).stat().st_size > 50)
-
-                    if has_profile and has_voice and has_icps and important_count >= 5:
-                        vault_state = "production_ready"
-                    elif has_profile and has_voice and has_icps and important_count >= 3:
-                        vault_state = "partial"
-                    elif has_profile:
-                        vault_state = "minimal"
-                    else:
-                        vault_state = "empty"
-
-                    if vault_state == "production_ready":
-                        checks.append(_check(f"{acct_id}_vault", "pass",
-                            f"Vault production-ready: 01_CLIENTS/{slug}/ - full copy/advisory capability.",
-                            scope=acct_scope))
-                    elif vault_state == "partial":
-                        checks.append(_check(f"{acct_id}_vault", "pass",
-                            f"Vault partial: 01_CLIENTS/{slug}/ - campaign/ad creation works. Fill more files for better copy.",
-                            scope=acct_scope))
-                    elif vault_state == "minimal":
-                        missing = []
-                        if not has_voice: missing.append("04-brand-voice.md")
-                        if not has_icps: missing.append("02-icp-personas.md")
-                        checks.append(_check(f"{acct_id}_vault", "warn",
-                            f"Vault minimal: 01_CLIENTS/{slug}/ - campaign creation works but ad set/ad creation may be limited. Missing: {', '.join(missing)}",
-                            scope=acct_scope))
-                    else:
-                        checks.append(_check(f"{acct_id}_vault", "fail",
-                            f"Vault empty: 01_CLIENTS/{slug}/ exists but 00-profile.md is missing or empty. Fill it with account IDs.",
-                            scope=acct_scope))
-        else:
-            # No vault at all - report once globally, not per-account
-            pass
 
         # Determine account readiness
         has_fails = any(c["status"] == "fail" and c["scope"] == acct_scope for c in checks)

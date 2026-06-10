@@ -19,6 +19,7 @@ from typing import Optional
 import httpx
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError, GRAPH_API_BASE
 from meta_ads_mcp.core.utils import ensure_account_id_format
 
@@ -79,7 +80,7 @@ def _validate_video_file(video_path: str) -> tuple[bool, str, dict]:
     return True, "", info
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def upload_video_asset(
     account_id: str,
     video_path: str,
@@ -224,7 +225,7 @@ def upload_video_asset(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def poll_video_processing(
     video_id: str,
     max_attempts: int = 30,

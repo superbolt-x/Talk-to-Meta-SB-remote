@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format
 
@@ -149,7 +150,7 @@ def _classify_audience_health(audience: dict) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def list_custom_audiences(
     account_id: str,
     limit: int = 50,

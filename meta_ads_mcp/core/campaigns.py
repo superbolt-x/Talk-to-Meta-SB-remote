@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format, format_budget_cents_to_currency
 
@@ -54,7 +55,7 @@ CAMPAIGN_DETAIL_FIELDS = CAMPAIGN_LIST_FIELDS + [
 ]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_campaigns(
     account_id: str,
     status_filter: Optional[str] = None,
@@ -142,7 +143,7 @@ def get_campaigns(
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_campaign_details(campaign_id: str) -> dict:
     """
     Get detailed information about a specific campaign including
@@ -188,7 +189,7 @@ def get_campaign_details(campaign_id: str) -> dict:
 
 # --- Phase v1.3: Write Operations ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def create_campaign(
     account_id: str,
     name: str,
@@ -220,11 +221,7 @@ def create_campaign(
     account_id = ensure_account_id_format(account_id)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # --- Vault gate ---
-    from meta_ads_mcp.core.vault_reader import enforce_vault_gate
-    vault_error, vault_ctx = enforce_vault_gate(account_id, "create_campaign")
-    if vault_error:
-        return vault_error
+    vault_ctx = {}
 
     # --- Step 0: Input validation (hard gates) ---
 
@@ -458,19 +455,13 @@ def create_campaign(
         "verification": verification,
         "rollback_reference": rollback_ref,
         "mutation_log_entry": log_entry,
-        "vault_status": {
-            "client_slug": vault_ctx.get("client_slug"),
-            "vault_readiness": vault_ctx.get("vault_readiness"),
-            "vault_files_loaded": vault_ctx.get("vault_files_loaded"),
-            "resolved_ids": vault_ctx.get("resolved_ids"),
-        },
         "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
     }
 
 
 # --- Phase C.1: Campaign update ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
 def update_campaign(
     campaign_id: str,
     name: Optional[str] = None,

@@ -12,6 +12,7 @@ import logging
 from typing import Any, Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format, parse_date_range
 
@@ -414,7 +415,7 @@ def _validate_breakdowns(breakdowns: list[str]) -> tuple[bool, str]:
     return True, ""
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_insights(
     object_id: str,
     time_range: str = "last_7d",
@@ -571,7 +572,7 @@ def get_insights(
 
 # --- Gap Closure: Bulk Cross-Account Insights ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_bulk_insights(
     time_range: str = "last_7d",
     level: str = "account",

@@ -41,6 +41,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format
 
@@ -223,7 +224,7 @@ def _build_simple_creative_spec(
 
 # ==================== READ TOOLS ====================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_ads(
     account_id: str,
     campaign_id: Optional[str] = None,
@@ -291,7 +292,7 @@ def get_ads(
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_ad_details(ad_id: str) -> dict:
     """
     Get detailed ad information including creative reference,
@@ -330,7 +331,7 @@ def get_ad_details(ad_id: str) -> dict:
 
 # ==================== WRITE TOOLS ====================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def create_ad_from_manifest(
     account_id: str,
     adset_id: str,
@@ -400,11 +401,7 @@ def create_ad_from_manifest(
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     overrides_applied = []
 
-    # --- Vault gate ---
-    from meta_ads_mcp.core.vault_reader import enforce_vault_gate
-    vault_error, vault_ctx = enforce_vault_gate(account_id, "create_ad")
-    if vault_error:
-        return vault_error
+    vault_ctx = {}
 
     # ============================================================
     # Step 0: Load and validate manifest entry
@@ -939,7 +936,7 @@ def create_ad_from_manifest(
 
 # --- Phase C.3: Ad update ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
 def update_ad(
     ad_id: str,
     name: Optional[str] = None,

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format
 
@@ -183,7 +184,7 @@ def _classify_pixel_health(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_pixel_info(pixel_id: str) -> dict:
     """
     Get pixel status, connections, last fired time, and availability.
@@ -209,7 +210,7 @@ def get_pixel_info(pixel_id: str) -> dict:
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_pixel_events(pixel_id: str) -> dict:
     """
     Get events received by a pixel in the last 24 hours,
@@ -257,7 +258,7 @@ def get_pixel_events(pixel_id: str) -> dict:
         raise
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_event_stats(
     pixel_id: str,
     archetype: str = "hybrid",
@@ -356,7 +357,7 @@ def get_event_stats(
     return diagnostic_summary
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def send_test_event(
     pixel_id: str,
     event_name: str = "PageView",
@@ -434,7 +435,7 @@ def send_test_event(
         }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def run_tracking_diagnostic(
     account_id: str,
     archetype: str = "hybrid",

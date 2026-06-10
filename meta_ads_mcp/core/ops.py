@@ -18,6 +18,7 @@ import httpx
 from meta_ads_mcp.core.api import api_client, MetaAPIError, GRAPH_API_BASE
 from meta_ads_mcp.core.utils import ensure_account_id_format
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 
 logger = logging.getLogger("meta-ads-mcp.ops")
 
@@ -26,7 +27,7 @@ logger = logging.getLogger("meta-ads-mcp.ops")
 # 1. RESUMABLE VIDEO UPLOAD
 # ===================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def upload_video_resumable(
     account_id: str,
     video_path: str,
@@ -126,7 +127,7 @@ def upload_video_resumable(
 # 2. BULK RENAME
 # ===================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
 def bulk_rename_objects(
     renames_json: str,
 ) -> dict:
@@ -166,7 +167,7 @@ def bulk_rename_objects(
 # 3. BULK DELETE CAMPAIGN STRUCTURE
 # ===================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
 def delete_campaign_structure(
     account_id: str,
     campaign_ids_json: Optional[str] = None,
@@ -267,7 +268,7 @@ def delete_campaign_structure(
 # 4. BROWSER PIXEL DIAGNOSTIC
 # ===================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def diagnose_pixel_on_site(
     url: str,
     pixel_id: Optional[str] = None,
@@ -362,7 +363,7 @@ def diagnose_pixel_on_site(
 # 5. PAGE IDENTITY RESOLUTION
 # ===================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def resolve_page_identity(
     page_id: str,
     account_id: str = None,

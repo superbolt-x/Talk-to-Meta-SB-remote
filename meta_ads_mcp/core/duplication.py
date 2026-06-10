@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Optional
 
 from meta_ads_mcp.server import mcp
+from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.utils import ensure_account_id_format, currency_to_cents
 
@@ -36,7 +37,7 @@ def _apply_name_suffix(source_name: str, suffix: str) -> str:
         return f"{source_name}{suffix}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def duplicate_campaign(
     campaign_id: str,
     account_id: str,
@@ -503,7 +504,7 @@ def _duplicate_ads_for_adset(
 
 # --- Convenience Gap: Standalone Ad Set Duplication ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
 def duplicate_adset(
     adset_id: str,
     target_campaign_id: str,
