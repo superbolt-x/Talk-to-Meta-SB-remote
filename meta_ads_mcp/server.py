@@ -210,30 +210,76 @@ else:
     logger.info("Open-core mode - %s public tools loaded. Premium tools not available.", "55")
 
 
+def _make_auth_middleware(auth_token: str):
+    """Return a Starlette middleware class that enforces Bearer token auth."""
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    class BearerAuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            # Health probe bypasses auth so Railway/load-balancers can reach it
+            if request.url.path == "/health":
+                return await call_next(request)
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer ") or auth[len("Bearer "):] != auth_token:
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return await call_next(request)
+
+    return BearerAuthMiddleware
+
+
 def main():
     """Run the MCP server.
 
     Transport is controlled by the MCP_TRANSPORT env var:
-      - streamable-http (default) — modern HTTP transport, recommended for remote deployments
+      - streamable-http (default) — modern HTTP, recommended for remote deployments
       - sse                       — legacy Server-Sent Events HTTP transport
       - stdio                     — local stdio transport for Claude Desktop / CLI
 
     HTTP-specific env vars (ignored for stdio):
-      MCP_HOST  — bind address (default: 0.0.0.0)
-      MCP_PORT  — bind port    (default: 8000)
+      MCP_HOST       — bind address (default: 0.0.0.0)
+      MCP_PORT       — bind port    (default: 8000)
+      MCP_AUTH_TOKEN — bearer token required on every request (strongly recommended)
     """
     import os
+    import uvicorn
+
     transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
     mode = "premium (98 tools)" if PREMIUM_AVAILABLE else "open-core (55 tools)"
     logger.info("Starting KonQuest Meta Ads MCP server v%s [%s] transport=%s", "2.0.0", mode, transport)
 
     if transport == "stdio":
         mcp.run(transport="stdio")
-    else:
-        host = os.environ.get("MCP_HOST", "0.0.0.0")
-        port = int(os.environ.get("MCP_PORT", "8000"))
-        logger.info("Listening on %s:%s", host, port)
-        mcp.run(transport=transport, host=host, port=port)
+        return
+
+    host = os.environ.get("MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("MCP_PORT", "8000"))
+    auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
+
+    if not auth_token:
+        logger.warning("MCP_AUTH_TOKEN is not set — server is OPEN to anyone with the URL")
+
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from starlette.routing import Mount, Route
+
+    mcp_app = mcp.streamable_http_app() if transport == "streamable-http" else mcp.sse_app()
+
+    async def health(_: Request):
+        return JSONResponse({"status": "ok", "transport": transport})
+
+    app = Starlette(routes=[
+        Route("/health", health),
+        Mount("/", app=mcp_app),
+    ])
+
+    if auth_token:
+        app.add_middleware(_make_auth_middleware(auth_token))
+        logger.info("Bearer auth enabled")
+
+    logger.info("Listening on %s:%s", host, port)
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
