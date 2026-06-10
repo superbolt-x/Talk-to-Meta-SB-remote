@@ -253,7 +253,8 @@ def main():
         return
 
     host = os.environ.get("MCP_HOST", "0.0.0.0")
-    port = int(os.environ.get("MCP_PORT", "8000"))
+    # Railway (and most PaaS) inject PORT; MCP_PORT is a fallback for local/Docker use
+    port = int(os.environ.get("PORT") or os.environ.get("MCP_PORT", "8000"))
     auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
 
     if not auth_token:
