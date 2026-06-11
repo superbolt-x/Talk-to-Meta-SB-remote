@@ -286,13 +286,15 @@ def main():
     from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
     from starlette.routing import Mount, Route
 
+    import json as _json
+    from contextlib import asynccontextmanager
+
     _raw_mcp_app = mcp.streamable_http_app() if transport == "streamable-http" else mcp.sse_app()
 
     # ── Grant-type normalisation middleware ───────────────────────────────────
     # Claude Team sends grant_types=["authorization_code"] without "refresh_token".
     # The MCP SDK's /register handler requires BOTH; this ASGI wrapper silently
     # adds "refresh_token" before the SDK ever sees the request body.
-    import json as _json
 
     class _GrantTypeFixMiddleware:
         """Patch POST /register to include refresh_token in grant_types."""
@@ -341,6 +343,15 @@ def main():
 
     mcp_app = _GrantTypeFixMiddleware(_raw_mcp_app)
 
+    # ── Lifespan: run the MCP session manager task group ─────────────────────
+    # The StreamableHTTPSessionManager must be started via its own lifespan
+    # before it can handle requests. We extract it from the inner Starlette app
+    # and attach it to the outer app so uvicorn triggers it on startup.
+    @asynccontextmanager
+    async def lifespan(_app):
+        async with _raw_mcp_app.router.lifespan_context(_app):
+            yield
+
     async def health(_: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "transport": transport, "oauth": bool(_oauth_provider)})
 
@@ -375,7 +386,7 @@ def main():
         Mount("/", app=mcp_app),
     ]
 
-    app = Starlette(routes=routes)
+    app = Starlette(lifespan=lifespan, routes=routes)
     logger.info("Listening on %s:%s", host, port)
     uvicorn.run(app, host=host, port=port)
 
