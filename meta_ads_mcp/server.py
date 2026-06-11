@@ -12,8 +12,8 @@ logger = logging.getLogger("konquest-meta-ads")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
 # ── OAuth setup (required for Claude Team remote MCP) ────────────────────────
-# SERVER_URL must match the public Railway URL exactly, e.g. https://xxx.railway.app
-# MCP_AUTH_TOKEN is the passphrase users enter once in the browser to authorize Claude.
+# SERVER_URL: public Railway base URL, e.g. https://xxx.railway.app  (NO trailing slash, NO /mcp)
+# MCP_AUTH_TOKEN: passphrase users enter once in the browser to authorize Claude.
 
 _server_url = os.environ.get("SERVER_URL", "").rstrip("/")
 _auth_token  = os.environ.get("MCP_AUTH_TOKEN", "")
@@ -25,8 +25,11 @@ if _server_url and _auth_token:
     _oauth_provider = SimpleMCPOAuthProvider(auth_token=_auth_token)
 
     _auth_settings = AuthSettings(
+        # issuer_url = base URL — used to build OAuth endpoint URLs (/authorize, /token, /register)
         issuer_url=_server_url,                         # type: ignore[arg-type]
-        resource_server_url=_server_url,                # type: ignore[arg-type]
+        # resource_server_url = MCP endpoint URL — used to build /.well-known/oauth-protected-resource/mcp
+        # This MUST include /mcp so the WWW-Authenticate header points Claude to the right metadata path.
+        resource_server_url=f"{_server_url}/mcp",       # type: ignore[arg-type]
         client_registration_options=ClientRegistrationOptions(
             enabled=True,                               # Claude auto-registers
             valid_scopes=["mcp"],
@@ -40,7 +43,7 @@ if _server_url and _auth_token:
         auth=_auth_settings,
         auth_server_provider=_oauth_provider,
     )
-    logger.info("OAuth enabled — issuer: %s", _server_url)
+    logger.info("OAuth enabled — issuer: %s  resource: %s/mcp", _server_url, _server_url)
 else:
     _oauth_provider = None
     mcp = FastMCP(
