@@ -286,7 +286,60 @@ def main():
     from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
     from starlette.routing import Mount, Route
 
-    mcp_app = mcp.streamable_http_app() if transport == "streamable-http" else mcp.sse_app()
+    _raw_mcp_app = mcp.streamable_http_app() if transport == "streamable-http" else mcp.sse_app()
+
+    # ── Grant-type normalisation middleware ───────────────────────────────────
+    # Claude Team sends grant_types=["authorization_code"] without "refresh_token".
+    # The MCP SDK's /register handler requires BOTH; this ASGI wrapper silently
+    # adds "refresh_token" before the SDK ever sees the request body.
+    import json as _json
+
+    class _GrantTypeFixMiddleware:
+        """Patch POST /register to include refresh_token in grant_types."""
+
+        def __init__(self, app):
+            self._app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http" and scope.get("path") == "/register":
+                # Buffer the full request body
+                chunks: list[bytes] = []
+                more = True
+                while more:
+                    msg = await receive()
+                    chunks.append(msg.get("body", b""))
+                    more = msg.get("more_body", False)
+                body = b"".join(chunks)
+
+                # Normalise grant_types
+                try:
+                    data = _json.loads(body)
+                    gt = set(data.get("grant_types") or [])
+                    if "authorization_code" in gt and "refresh_token" not in gt:
+                        data["grant_types"] = sorted(gt | {"refresh_token"})
+                        body = _json.dumps(data).encode()
+                        logger.debug(
+                            "register: added refresh_token to grant_types → %s",
+                            data["grant_types"],
+                        )
+                except Exception:
+                    pass  # leave body unchanged if not valid JSON
+
+                # Replay the (possibly modified) body as a single receive call
+                _body_sent = False
+
+                async def _patched_receive():
+                    nonlocal _body_sent
+                    if not _body_sent:
+                        _body_sent = True
+                        return {"type": "http.request", "body": body, "more_body": False}
+                    return {"type": "http.disconnect"}
+
+                await self._app(scope, _patched_receive, send)
+            else:
+                await self._app(scope, receive, send)
+
+    mcp_app = _GrantTypeFixMiddleware(_raw_mcp_app)
 
     async def health(_: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "transport": transport, "oauth": bool(_oauth_provider)})
