@@ -210,24 +210,6 @@ else:
     logger.info("Open-core mode - %s public tools loaded. Premium tools not available.", "55")
 
 
-def _make_auth_middleware(auth_token: str):
-    """Return a Starlette middleware class that enforces Bearer token auth."""
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.responses import JSONResponse
-
-    class BearerAuthMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            # Health probe bypasses auth so Railway/load-balancers can reach it
-            if request.url.path == "/health":
-                return await call_next(request)
-            auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Bearer ") or auth[len("Bearer "):] != auth_token:
-                return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            return await call_next(request)
-
-    return BearerAuthMiddleware
-
-
 def main():
     """Run the MCP server.
 
@@ -237,9 +219,12 @@ def main():
       - stdio                     — local stdio transport for Claude Desktop / CLI
 
     HTTP-specific env vars (ignored for stdio):
-      MCP_HOST       — bind address (default: 0.0.0.0)
-      MCP_PORT       — bind port    (default: 8000)
-      MCP_AUTH_TOKEN — bearer token required on every request (strongly recommended)
+      MCP_HOST — bind address (default: 0.0.0.0)
+      MCP_PORT — bind port    (default: 8000)
+
+    Note: auth is handled at the network level (keep the Railway URL internal).
+    Custom Bearer middleware is intentionally omitted — Claude Team's connector
+    performs OAuth discovery and cannot use a simple bearer gate.
     """
     import os
     import uvicorn
@@ -255,10 +240,6 @@ def main():
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     # Railway (and most PaaS) inject PORT; MCP_PORT is a fallback for local/Docker use
     port = int(os.environ.get("PORT") or os.environ.get("MCP_PORT", "8000"))
-    auth_token = os.environ.get("MCP_AUTH_TOKEN", "")
-
-    if not auth_token:
-        logger.warning("MCP_AUTH_TOKEN is not set — server is OPEN to anyone with the URL")
 
     from starlette.applications import Starlette
     from starlette.requests import Request
@@ -274,10 +255,6 @@ def main():
         Route("/health", health),
         Mount("/", app=mcp_app),
     ])
-
-    if auth_token:
-        app.add_middleware(_make_auth_middleware(auth_token))
-        logger.info("Bearer auth enabled")
 
     logger.info("Listening on %s:%s", host, port)
     uvicorn.run(app, host=host, port=port)
