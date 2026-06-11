@@ -5,15 +5,52 @@ Supervised Meta Ads Operating System for Claude Code.
 Open-core: public tools always available, premium tools require premium bundle.
 """
 import logging
+import os
 from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger("konquest-meta-ads")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
-mcp = FastMCP(
-    "KonQuest Meta Ads MCP",
-    instructions="Supervised Meta Ads Operating System for Claude Code. Create, read, update, duplicate campaigns, ad sets, and ads with validation gates, naming enforcement, and operator control.",
-)
+# ── OAuth setup (required for Claude Team remote MCP) ────────────────────────
+# SERVER_URL must match the public Railway URL exactly, e.g. https://xxx.railway.app
+# MCP_AUTH_TOKEN is the passphrase users enter once in the browser to authorize Claude.
+
+_server_url = os.environ.get("SERVER_URL", "").rstrip("/")
+_auth_token  = os.environ.get("MCP_AUTH_TOKEN", "")
+
+if _server_url and _auth_token:
+    from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+    from meta_ads_mcp.oauth import SimpleMCPOAuthProvider
+
+    _oauth_provider = SimpleMCPOAuthProvider(auth_token=_auth_token)
+
+    _auth_settings = AuthSettings(
+        issuer_url=_server_url,                         # type: ignore[arg-type]
+        resource_server_url=_server_url,                # type: ignore[arg-type]
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True,                               # Claude auto-registers
+            valid_scopes=["mcp"],
+            default_scopes=["mcp"],
+        ),
+    )
+
+    mcp = FastMCP(
+        "KonQuest Meta Ads MCP",
+        instructions="Supervised Meta Ads Operating System for Claude Code.",
+        auth=_auth_settings,
+        auth_server_provider=_oauth_provider,
+    )
+    logger.info("OAuth enabled — issuer: %s", _server_url)
+else:
+    _oauth_provider = None
+    mcp = FastMCP(
+        "KonQuest Meta Ads MCP",
+        instructions="Supervised Meta Ads Operating System for Claude Code.",
+    )
+    if not _server_url:
+        logger.warning("SERVER_URL not set — OAuth disabled (Claude Team will not be able to connect)")
+    if not _auth_token:
+        logger.warning("MCP_AUTH_TOKEN not set — OAuth disabled")
 
 # ============================================================
 # PUBLIC TOOLS (open-core, always available)
@@ -243,19 +280,46 @@ def main():
 
     from starlette.applications import Starlette
     from starlette.requests import Request
-    from starlette.responses import JSONResponse
+    from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
     from starlette.routing import Mount, Route
 
     mcp_app = mcp.streamable_http_app() if transport == "streamable-http" else mcp.sse_app()
 
-    async def health(_: Request):
-        return JSONResponse({"status": "ok", "transport": transport})
+    async def health(_: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok", "transport": transport, "oauth": bool(_oauth_provider)})
 
-    app = Starlette(routes=[
+    async def oauth_approve(request: Request) -> HTMLResponse | RedirectResponse:
+        """Passphrase approval page — the human-facing step of the OAuth flow."""
+        if _oauth_provider is None:
+            return HTMLResponse("OAuth not configured.", status_code=503)
+
+        pending_id = request.query_params.get("pending_id", "")
+
+        if request.method == "GET":
+            return HTMLResponse(_oauth_provider.render_approve_form(pending_id))
+
+        # POST — check passphrase
+        form = await request.form()
+        passphrase  = str(form.get("passphrase", ""))
+        pending_id  = str(form.get("pending_id", pending_id))
+        ok, redirect_url, error = _oauth_provider.handle_approval(pending_id, passphrase)
+
+        if ok and redirect_url:
+            return RedirectResponse(redirect_url, status_code=302)
+
+        # Wrong passphrase — re-render form with error
+        return HTMLResponse(
+            _oauth_provider.render_approve_form(pending_id, error or "Authorization failed."),
+            status_code=400,
+        )
+
+    routes = [
         Route("/health", health),
+        Route("/oauth/approve", oauth_approve, methods=["GET", "POST"]),
         Mount("/", app=mcp_app),
-    ])
+    ]
 
+    app = Starlette(routes=routes)
     logger.info("Listening on %s:%s", host, port)
     uvicorn.run(app, host=host, port=port)
 
