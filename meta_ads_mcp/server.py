@@ -19,7 +19,9 @@ _server_url = os.environ.get("SERVER_URL", "").rstrip("/")
 _auth_token  = os.environ.get("MCP_AUTH_TOKEN", "")
 
 if _server_url and _auth_token:
+    from urllib.parse import urlparse
     from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+    from mcp.server.transport_security import TransportSecuritySettings
     from meta_ads_mcp.oauth import SimpleMCPOAuthProvider
 
     _oauth_provider = SimpleMCPOAuthProvider(auth_token=_auth_token)
@@ -37,11 +39,21 @@ if _server_url and _auth_token:
         ),
     )
 
+    # Allow the Railway hostname in the MCP SDK's DNS-rebinding protection.
+    # Without this, every POST /mcp returns 421 "Invalid Host header".
+    _hostname = urlparse(_server_url).netloc  # e.g. talk-to-meta-sb-production.up.railway.app
+    _transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[_hostname, f"{_hostname}:*"],
+        allowed_origins=[_server_url, f"{_server_url}:*"],
+    )
+
     mcp = FastMCP(
         "KonQuest Meta Ads MCP",
         instructions="Supervised Meta Ads Operating System for Claude Code.",
         auth=_auth_settings,
         auth_server_provider=_oauth_provider,
+        transport_security=_transport_security,
     )
     logger.info("OAuth enabled — issuer: %s  resource: %s/mcp", _server_url, _server_url)
 else:
