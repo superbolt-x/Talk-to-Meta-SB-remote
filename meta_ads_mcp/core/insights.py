@@ -136,12 +136,18 @@ def _extract_action_cost(cost_per_action: list[dict], action_type: str) -> Optio
     return None
 
 
-def _extract_roas(action_values: list[dict]) -> Optional[str]:
-    """Extract purchase ROAS from action_values."""
+_PURCHASE_ACTION_TYPES = ("omni_purchase", "purchase", "offsite_conversion.fb_pixel_purchase")
+
+
+def _extract_roas(
+    action_values: list[dict],
+    action_types: tuple[str, ...] = _PURCHASE_ACTION_TYPES,
+) -> Optional[str]:
+    """Extract a value from action_values for the given action types (defaults to purchase)."""
     if not action_values:
         return None
     for item in action_values:
-        if item.get("action_type") in ("omni_purchase", "purchase", "offsite_conversion.fb_pixel_purchase"):
+        if item.get("action_type") in action_types:
             return item.get("value")
     return None
 
@@ -169,11 +175,21 @@ _PIXEL_CUSTOM_PREFIX = "offsite_conversion.fb_pixel_custom."
 _CUSTOM_CONV_PREFIX = "offsite_conversion.custom."
 
 
-def _normalize_metrics(row: dict, archetype: str = "hybrid", custom_conversion_names: dict | None = None) -> dict:
+def _normalize_metrics(
+    row: dict,
+    archetype: str = "hybrid",
+    custom_conversion_names: dict | None = None,
+    conversion_action_types: list[str] | None = None,
+    custom_conversion_id: str | None = None,
+) -> dict:
     """
     Normalize a single insights row into a consistent metric structure.
 
     Extracts action-type values into top-level keys based on archetype.
+
+    conversion_action_types / custom_conversion_id (optional, additive): when set,
+    also extract count + value + computed ROAS/CPA for that specific action type —
+    purchase or not. Purchase extraction above is unaffected either way.
     """
     actions = row.get("actions", [])
     cost_per_action = row.get("cost_per_action_type", [])
@@ -347,6 +363,32 @@ def _normalize_metrics(row: dict, archetype: str = "hybrid", custom_conversion_n
     if custom_conversions:
         normalized["custom_conversions"] = custom_conversions
 
+    # Caller-specified conversion type(s): count from actions, value from action_values,
+    # computed ROAS/CPA — same shape as the purchase block above, generalized to any
+    # action type (e.g. leads, add-to-cart, or an arbitrary offsite/onsite/omni type).
+    target_types = tuple(conversion_action_types or [])
+    if custom_conversion_id:
+        target_types = target_types + (f"{_CUSTOM_CONV_PREFIX}{custom_conversion_id}",)
+
+    if target_types:
+        conv_count = None
+        for action_type in target_types:
+            conv_count = _extract_action_value(actions, action_type)
+            if conv_count:
+                break
+        conv_value = _extract_roas(action_values, target_types)
+
+        normalized["target_conversion_action_types"] = list(target_types)
+        if conv_count is not None:
+            normalized["target_conversion_count"] = conv_count
+        if conv_value is not None:
+            normalized["target_conversion_value"] = conv_value
+        spend = float(normalized["spend"]) if normalized.get("spend") else 0
+        if conv_value is not None and spend > 0:
+            normalized["target_conversion_roas"] = f"{float(conv_value) / spend:.2f}"
+        if conv_count and spend > 0 and float(conv_count) > 0:
+            normalized["target_conversion_cpa"] = f"{spend / float(conv_count):.2f}"
+
     return normalized
 
 
@@ -424,6 +466,8 @@ def get_insights(
     archetype: str = "hybrid",
     compact: bool = True,
     limit: int = 1000,
+    conversion_action_types: Optional[str] = None,
+    custom_conversion_id: Optional[str] = None,
 ) -> dict:
     """
     Get performance insights for any Meta Ads object (account, campaign, ad set, or ad).
@@ -444,6 +488,14 @@ def get_insights(
             'awareness', 'traffic', 'hybrid', 'messages'. Default 'hybrid' (all metrics).
         compact: If true, return a compact operator-friendly summary alongside raw data.
         limit: Max rows for breakdown or level queries (default 1000).
+        conversion_action_types: Comma-separated Meta action types (e.g.
+            'onsite_conversion.lead_grouped,offsite_conversion.fb_pixel_lead') to extract
+            count/value/ROAS/CPA for, independent of archetype and purchases. Non-purchase
+            action values (leads, add-to-cart, etc.) aren't extracted by default — this is
+            how to pull them. Additive: purchase metrics/behavior are unaffected.
+        custom_conversion_id: An account-configured custom conversion ID (as returned by
+            the Meta API's customconversions endpoint) to extract count/value/ROAS/CPA for.
+            Combines with conversion_action_types if both are set.
     """
     api_client._ensure_initialized()
 
@@ -526,7 +578,18 @@ def get_insights(
             custom_conversion_names = _fetch_custom_conversion_names(account_id_for_names)
 
         # Normalize all rows
-        normalized_rows = [_normalize_metrics(row, archetype, custom_conversion_names) for row in rows]
+        action_types_list = (
+            [t.strip() for t in conversion_action_types.split(",") if t.strip()]
+            if conversion_action_types else None
+        )
+        normalized_rows = [
+            _normalize_metrics(
+                row, archetype, custom_conversion_names,
+                conversion_action_types=action_types_list,
+                custom_conversion_id=custom_conversion_id,
+            )
+            for row in rows
+        ]
 
         # Build response
         response: dict[str, Any] = {
