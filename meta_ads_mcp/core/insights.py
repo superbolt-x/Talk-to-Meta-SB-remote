@@ -371,12 +371,15 @@ def _normalize_metrics(
         target_types = target_types + (f"{_CUSTOM_CONV_PREFIX}{custom_conversion_id}",)
 
     if target_types:
+        # Count/value can live in actions/action_values OR conversions/conversion_values
+        # (Meta puts pixel-custom and account-configured conversions in the latter) —
+        # check both, same as the pixel_conversions/custom_conversions blocks above.
         conv_count = None
         for action_type in target_types:
-            conv_count = _extract_action_value(actions, action_type)
+            conv_count = _extract_action_value(actions, action_type) or _extract_action_value(conversions_raw, action_type)
             if conv_count:
                 break
-        conv_value = _extract_roas(action_values, target_types)
+        conv_value = _extract_roas(action_values, target_types) or _extract_roas(conversion_values_raw, target_types)
 
         normalized["target_conversion_action_types"] = list(target_types)
         if conv_count is not None:

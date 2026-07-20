@@ -5,12 +5,14 @@ meta_ads_mcp.core.insights (_normalize_metrics / _extract_roas).
 from meta_ads_mcp.core.insights import _normalize_metrics, _extract_roas
 
 
-def _row(actions=None, action_values=None, spend="100"):
+def _row(actions=None, action_values=None, conversions=None, conversion_values=None, spend="100"):
     return {
         "spend": spend,
         "impressions": "1000",
         "actions": actions or [],
         "action_values": action_values or [],
+        "conversions": conversions or [],
+        "conversion_values": conversion_values or [],
     }
 
 
@@ -75,6 +77,33 @@ class TestConversionActionTypesParam:
         assert "target_conversion_count" not in normalized
         assert "target_conversion_value" not in normalized
         assert normalized["target_conversion_action_types"] == ["lead"]
+
+
+class TestConversionsArrayFallback:
+    """Regression test: found live against Happiest Baby (act_61643804) — pixel-custom
+    conversions put count/value in conversions/conversion_values, not actions/action_values.
+    The target_conversion_* extraction must check both pairs, like pixel_conversions does."""
+
+    def test_extracts_from_conversions_when_absent_from_actions(self):
+        row = _row(
+            actions=[],
+            action_values=[],
+            conversions=[{"action_type": "offsite_conversion.fb_pixel_custom.Sleepea Purchase", "value": "703"}],
+            conversion_values=[{"action_type": "offsite_conversion.fb_pixel_custom.Sleepea Purchase", "value": "28933.04"}],
+        )
+        normalized = _normalize_metrics(
+            row, conversion_action_types=["offsite_conversion.fb_pixel_custom.Sleepea Purchase"],
+        )
+        assert normalized["target_conversion_count"] == "703"
+        assert normalized["target_conversion_value"] == "28933.04"
+
+    def test_prefers_actions_over_conversions_when_both_present(self):
+        row = _row(
+            actions=[{"action_type": "lead", "value": "5"}],
+            conversions=[{"action_type": "lead", "value": "999"}],
+        )
+        normalized = _normalize_metrics(row, conversion_action_types=["lead"])
+        assert normalized["target_conversion_count"] == "5"
 
 
 class TestCustomConversionIdParam:
