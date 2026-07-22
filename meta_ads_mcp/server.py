@@ -72,7 +72,19 @@ logger.info("Meta Ads MCP configured — server_url=%s auth_gate=%s", SERVER_URL
 class TokenGateMiddleware:
     """Authless-with-a-shared-secret ASGI gate. When a token is configured, require
     it on every HTTP request (from ?access_token=/token or Bearer). Correct token →
-    pass through (no auth challenge); otherwise 401."""
+    pass through (no auth challenge); otherwise 401.
+
+    Authless means: advertise NO OAuth. OAuth/OIDC discovery probes are answered
+    with 404 (never 401) so Claude's connector reads "this server is not
+    OAuth-protected" and connects directly, instead of mistaking a 401 for an
+    OAuth challenge and failing on Dynamic Client Registration."""
+
+    # Well-known prefixes a client probes to discover an OAuth/OIDC sign-in service.
+    _OAUTH_DISCOVERY_PREFIXES = (
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/openid-configuration",
+    )
 
     def __init__(self, app, token: str):
         self._app = app
@@ -91,8 +103,16 @@ class TokenGateMiddleware:
         return ""
 
     async def __call__(self, scope, receive, send):
-        if self._token and scope.get("type") == "http":
-            if not secrets.compare_digest(self._provided(scope), self._token):
+        if scope.get("type") == "http":
+            path = scope.get("path", "")
+            # Authless: no OAuth is advertised. 404 the discovery probes so the
+            # connector never attempts OAuth/DCR (which would fail — there is no
+            # auth server). Applies whether or not a shared-secret token is set.
+            if any(path.startswith(p) for p in self._OAUTH_DISCOVERY_PREFIXES):
+                from starlette.responses import PlainTextResponse
+                await PlainTextResponse("Not Found", status_code=404)(scope, receive, send)
+                return
+            if self._token and not secrets.compare_digest(self._provided(scope), self._token):
                 from starlette.responses import JSONResponse
                 await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
                 return
