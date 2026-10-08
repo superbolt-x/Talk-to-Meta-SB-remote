@@ -329,8 +329,12 @@ def install(monkeypatch, object_days, entities=None, ranking_error=None, object_
         if endpoint.endswith("/insights"):
             if "filtering" in p and "time_increment" not in p:  # "did these ACTIVE entities deliver?"
                 wanted = json.loads(p["filtering"])[0]["value"]
-                return {"data": [{"campaign_id": eid, "spend": "10", "impressions": "1000"}
-                                 for eid, _, _ in entities if eid in wanted]}
+                window = json.loads(p["time_range"])
+                return {"data": [
+                    {"campaign_id": eid, "spend": "10", "impressions": "1000"}
+                    for eid, _, dd in entities
+                    if eid in wanted and any(window["since"] <= dt <= window["until"] and rec["spend"] > 0
+                                             for dt, rec in dd.items())]}
             if "filtering" in p:
                 if entity_daily_error:
                     raise entity_daily_error
@@ -691,7 +695,7 @@ class TestActiveButNotDelivering:
         silent = [a for a in out["anomalies"] if a["metric"] == "not_delivering"]
         assert [a["entity"]["id"] for a in silent] == ["S1"]
         assert silent[0]["severity"] == "MEDIUM" and silent[0]["assessment"] == "worse"
-        assert "ACTIVE but no spend in the last 17 days (daily budget USD 3000.00)" in silent[0]["message"]
+        assert "ACTIVE but no spend in the last 3 days (daily budget USD 3000.00)" in silent[0]["message"]
         assert out["summary"]["worse"] == 1 and out["summary"]["top_finding"] == silent[0]["message"]
 
     def test_new_and_scheduled_entities_get_the_benefit_of_the_doubt(self, monkeypatch):
@@ -732,6 +736,89 @@ class TestActiveButNotDelivering:
         run(object_id="act_1")
         assert not [c for c in calls if c["endpoint"].endswith("/insights") and "filtering" in c["params"]
                     and "time_increment" not in c["params"]]
+
+
+class TestNotDeliveringLiveFindings:
+    """Round-two live findings: Stripes was missed, a PAUSED ad set was flagged, and a "USD 0.00" budget showed."""
+
+    LONG_AGO = "2026-01-01T00:00:00+0000"
+
+    def stripes(self, delivered_days):
+        entity = ("ST", "Stripes campaign", stable_days(delivered_days))
+        active = [{"id": "ST", "name": "Stripes campaign", "effective_status": "ACTIVE",
+                   "daily_budget": "300000", "created_time": self.LONG_AGO}]
+        return entity, active
+
+    def flagged(self, out):
+        return [a for a in out["anomalies"] if a["metric"] == "not_delivering"]
+
+    def test_an_active_campaign_that_spent_earlier_in_the_window_but_not_since_is_flagged(self, monkeypatch):
+        entity, active = self.stripes(ALL[:2])  # spent Sep 21-22, then every ad set was paused
+        install(monkeypatch, account_series(), [entity], active=active)
+        out = run(object_id="act_1")
+        silent = self.flagged(out)
+        assert [a["entity"]["id"] for a in silent] == ["ST"]
+        assert "ACTIVE but no spend since 2026-09-22 (daily budget USD 3000.00)" in silent[0]["message"]
+        assert out["summary"]["top_finding"] == silent[0]["message"]
+
+    def test_the_old_rule_ignored_an_entity_that_died_before_the_recent_window_but_it_is_news_when_active(self, monkeypatch):
+        entity, active = self.stripes(ALL[:9])  # 9 days of delivery, then nothing for 8 days
+        install(monkeypatch, account_series(), [entity], active=active)
+        out = run(object_id="act_1")
+        assert [a["metric"] for a in out["anomalies"]] == ["not_delivering"]  # analyze_entity alone says "not news"
+        assert "since 2026-09-29" in out["anomalies"][0]["message"]
+
+    def test_the_delivery_check_looks_at_the_recent_window_only(self, monkeypatch):
+        entity, active = self.stripes(ALL[:2])
+        calls = install(monkeypatch, account_series(), [entity], active=active)
+        run(object_id="act_1")
+        check = next(c for c in calls if c["endpoint"].endswith("/insights") and "filtering" in c["params"]
+                     and "time_increment" not in c["params"])
+        assert json.loads(check["params"]["time_range"]) == {"since": RECENT[0], "until": RECENT[-1]}
+
+    def test_an_active_entity_that_is_spending_now_is_not_flagged(self, monkeypatch):
+        install(monkeypatch, account_series(), [("OK", "Spending", stable_days(ALL))],
+                active=[{"id": "OK", "name": "Spending", "effective_status": "ACTIVE", "created_time": self.LONG_AGO}])
+        assert self.flagged(run(object_id="act_1")) == []
+
+    def test_a_paused_entity_returned_despite_the_filter_is_ignored(self, monkeypatch):
+        # Seen live: ad set 6985984762441 was PAUSED yet came back from the ACTIVE-filtered lookup
+        active = [
+            {"id": "P", "name": "Broad Website", "effective_status": "PAUSED", "created_time": self.LONG_AGO,
+             "lifetime_budget": "11473200", "daily_budget": "0"},
+            {"id": "CP", "name": "Parent paused", "effective_status": "CAMPAIGN_PAUSED", "created_time": self.LONG_AGO},
+        ]
+        install(monkeypatch, account_series(), [("OK", "Spending", stable_days(ALL))], active=active)
+        out = run(object_id="act_1", level="campaign")
+        assert self.flagged(out) == []
+
+    def test_a_zero_budget_is_not_shown_and_the_real_one_is(self, monkeypatch):
+        # Seen live: a lifetime-budget ad set reported daily_budget "0", printed as "daily budget USD 0.00"
+        entity = ("L", "Lifetime", stable_days(ALL[:2]))
+        active = [{"id": "L", "name": "Lifetime", "effective_status": "ACTIVE", "created_time": self.LONG_AGO,
+                   "daily_budget": "0", "lifetime_budget": "11473200"}]
+        install(monkeypatch, account_series(), [entity], active=active)
+        message = self.flagged(run(object_id="act_1"))[0]["message"]
+        assert "(lifetime budget USD 114732.00)" in message and "0.00)" not in message.replace("114732.00)", "")
+
+    def test_no_budget_at_all_means_no_budget_text(self, monkeypatch):
+        entity = ("N", "No budget", stable_days(ALL[:2]))
+        active = [{"id": "N", "name": "No budget", "effective_status": "ACTIVE", "created_time": self.LONG_AGO,
+                   "daily_budget": "0", "lifetime_budget": "0"}]
+        install(monkeypatch, account_series(), [entity], active=active)
+        message = self.flagged(run(object_id="act_1"))[0]["message"]
+        assert message.startswith("ACTIVE but no spend since 2026-09-22. ")
+        assert "budget" not in message.split(". ")[0]
+
+    def test_a_stopped_delivering_finding_is_not_duplicated_and_notes_the_entity_is_still_active(self, monkeypatch):
+        stopped = ("SD", "Stopped", stable_days(BASELINE))  # ran the whole baseline, nothing in the last 3 days
+        active = [{"id": "SD", "name": "Stopped", "effective_status": "ACTIVE", "created_time": self.LONG_AGO}]
+        install(monkeypatch, account_series(), [stopped], active=active)
+        out = run(object_id="act_1")
+        mine = [a for a in out["anomalies"] if a["entity"]["id"] == "SD"]
+        assert [a["metric"] for a in mine] == ["delivery"]
+        assert mine[0]["message"].endswith("It is still ACTIVE.")
+        assert out["summary"]["worse"] == 1
 
 
 def test_registered_as_read_only_tool():
