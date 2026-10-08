@@ -547,14 +547,28 @@ def _find_silent_active(object_id: str, level: str, recent_dates: list[str], cur
         if entity["id"] in delivered:
             continue
         label, cents = _positive_budget(entity)
-        detail = f" ({label} {format_budget_cents_to_currency(cents, currency)})" if cents else ""
         since = last_spend.get(entity["id"])
-        when = f"since {since}" if since else f"in the last {len(recent_dates)} days"
+        facts = []
+        if since:
+            facts.append(f"last spend {since}")
+        if cents:
+            facts.append(f"{label} {format_budget_cents_to_currency(cents, currency)}")
+        detail = f" ({'; '.join(facts)})" if facts else ""
+        # An ad set with no budget of its own is under a campaign budget (CBO), where Meta routinely starves
+        # an ad set in favour of others, so it is worth a look but not as urgent as a campaign that is silent.
+        cbo_adset = level == "adset" and not cents
+        advice = {
+            "campaign": "Check whether its ad sets or ads are paused, or it is out of budget or rejected.",
+            "adset": ("Its campaign appears to use a campaign budget (CBO), so Meta may simply be spending "
+                      "elsewhere; check it if you expect it to run." if cbo_adset else
+                      "Check whether its ads are paused or rejected, or its budget is exhausted."),
+            "ad": "Check whether it was rejected or is limited.",
+        }[level]
         found.append({
-            "metric": "not_delivering", "unit": "status check", "assessment": "worse", "severity": "MEDIUM",
+            "metric": "not_delivering", "unit": "status check", "assessment": "worse",
+            "severity": "LOW" if cbo_adset else "MEDIUM",
             "recent": 0.0, "baseline": 0.0, "change_pct": None, "z_score": None,
-            "message": f"ACTIVE but no spend {when}{detail}. "
-                       "Check whether its ad sets or ads are paused, or it is out of budget or rejected.",
+            "message": f"ACTIVE but no spend in the last {len(recent_dates)} days{detail}. {advice}",
             "entity": {"level": level, "id": entity["id"], "name": entity.get("name")},
             "_spend": 0.0,
         })
