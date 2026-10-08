@@ -998,3 +998,126 @@ def get_dataset_stats(
     elif wanted is not None and not event_reports:
         response["note"] = f"None of the requested events were received: {events}"
     return response
+
+
+# --- Custom conversions list ---
+
+CUSTOM_CONVERSION_FIELDS = [
+    "id", "name", "description", "rule", "custom_event_type", "default_conversion_value",
+    "creation_time", "first_fired_time", "last_fired_time", "is_archived", "is_unavailable", "event_source_type",
+]
+CUSTOM_CONVERSION_FIELDS_BASIC = ["id", "name", "rule", "custom_event_type", "last_fired_time", "is_archived"]
+CUSTOM_CONVERSION_STALE_DAYS = 30  # operator heuristic: no fire for this long is worth a look
+CUSTOM_CONVERSION_PAGE = 100       # Meta allows at most 100 custom conversions per ad account
+MAX_RULE_CHARS = 400
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("+0000", "+00:00").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def list_custom_conversions(account_id: str, include_archived: bool = False) -> dict:
+    """
+    List an ad account's custom conversions: name, rule, event type, default value, when each first and
+    last fired, and its status (active, stale, never fired, unavailable, archived).
+
+    Each conversion carries `insights_action_type`, the exact action type it has in Insights
+    (offsite_conversion.custom.<id>). Pass it as `conversion_action_type` to get_performance_signals
+    to analyze that conversion's cost and volume. Read-only.
+
+    Args:
+        account_id: Ad account ID (e.g., 'act_123456789').
+        include_archived: Also list archived conversions (default: hidden).
+    """
+    api_client._ensure_initialized()
+    account_id = ensure_account_id_format(account_id)
+    endpoint = f"/{account_id}/customconversions"
+    fields = CUSTOM_CONVERSION_FIELDS
+    rows: list[dict] = []
+    params: dict[str, str] = {"limit": str(CUSTOM_CONVERSION_PAGE)}
+    try:
+        for _ in range(3):
+            try:
+                res = api_client.graph_get(endpoint, fields=fields, params=params)
+            except MetaAPIError as e:
+                if e.error_code == 100 and fields is CUSTOM_CONVERSION_FIELDS:
+                    fields = CUSTOM_CONVERSION_FIELDS_BASIC
+                    continue
+                raise
+            rows.extend(r for r in res.get("data", []) if isinstance(r, dict))
+            paging = res.get("paging") or {}
+            cursor = (paging.get("cursors") or {}).get("after")
+            if not paging.get("next") or not cursor:
+                break
+            params["after"] = cursor
+    except MetaAPIError as e:
+        return {"account_id": account_id, "error": str(e), "error_code": e.error_code,
+                "hint": "Listing custom conversions needs ads_read and access to this ad account."}
+
+    now = _utc_now()
+    conversions = []
+    for raw in rows:
+        archived = bool(raw.get("is_archived"))
+        if archived and not include_archived:
+            continue
+        last = _parse_iso(raw.get("last_fired_time"))
+        days_since = int((now - last).total_seconds() // 86400) if last else None
+        if archived:
+            status = "archived"
+        elif raw.get("is_unavailable"):
+            status = "unavailable"
+        elif last is None:
+            status = "never_fired"
+        elif days_since >= CUSTOM_CONVERSION_STALE_DAYS:
+            status = "stale"
+        else:
+            status = "active"
+        rule = raw.get("rule")
+        conversions.append({
+            "id": raw.get("id"), "name": raw.get("name"), "description": raw.get("description"),
+            "rule": rule[:MAX_RULE_CHARS] if isinstance(rule, str) else rule,
+            "custom_event_type": raw.get("custom_event_type"),
+            "default_value": raw.get("default_conversion_value"),
+            "event_source_type": raw.get("event_source_type"),
+            "created": raw.get("creation_time"), "first_fired": raw.get("first_fired_time"),
+            "last_fired": raw.get("last_fired_time"), "days_since_last_fired": days_since,
+            "status": status,
+            "insights_action_type": f"offsite_conversion.custom.{raw.get('id')}",
+        })
+    order = {"active": 0, "stale": 1, "never_fired": 2, "unavailable": 3, "archived": 4}
+    conversions.sort(key=lambda c: (order[c["status"]], c["days_since_last_fired"] if c["days_since_last_fired"] is not None else 10**6))
+
+    counts: dict[str, int] = {}
+    for c in conversions:
+        counts[c["status"]] = counts.get(c["status"], 0) + 1
+    issues = []
+    for c in conversions:
+        label = c["name"] or c["id"]
+        if c["status"] == "unavailable":
+            issues.append({"severity": SEVERITY_MEDIUM, "check": "unavailable", "conversion_id": c["id"],
+                           "message": f"{label}: Meta marks this conversion unavailable",
+                           "fix": "Check its rule and event source in Events Manager."})
+        elif c["status"] == "stale":
+            issues.append({"severity": SEVERITY_LOW, "check": "stale", "conversion_id": c["id"],
+                           "message": f"{label}: last fired {c['days_since_last_fired']} days ago",
+                           "fix": "Check the page or event that triggers it still exists."})
+        elif c["status"] == "never_fired":
+            issues.append({"severity": SEVERITY_INFO, "check": "never_fired", "conversion_id": c["id"],
+                           "message": f"{label}: has never fired",
+                           "fix": "Check the rule matches a real URL or event, or archive it."})
+
+    response: dict[str, Any] = {
+        "account_id": account_id, "total": len(conversions), "counts": counts,
+        "issues": issues, "conversions": conversions,
+        "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
+    }
+    if not conversions:
+        response["note"] = "No custom conversions on this ad account."
+    return response

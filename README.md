@@ -72,7 +72,8 @@ meta_ads_mcp/
 | Ads | 4 | Create, read, update ads |
 | Creatives | 3 | Create, read ad creatives |
 | Insights & Analytics | 2 | Performance data with archetype-aware normalization; anomaly and trend signals |
-| Pixels & Tracking | 7 | Pixel health, event diagnostics, dataset quality (EMQ), test events, CAPI |
+| Change History & Delivery Errors | 2 | Account change history (who changed what, when); campaigns, ad sets and ads Meta has flagged |
+| Pixels & Tracking | 8 | Pixel health, event diagnostics, dataset quality (EMQ), event volume, custom conversions, test events, CAPI |
 | Catalogs & DPA | 11 | Product catalogs (list + read), feeds, feed health, product sets, validation |
 | Audiences | 1 | Custom audience listing |
 | Targeting | 3 | Interest, behavior, and geo search |

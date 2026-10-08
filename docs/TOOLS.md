@@ -119,7 +119,7 @@ Get full creative spec with mode classification, media extraction, copy parsing,
 
 Returns: creative_mode, media (images/videos with URLs), copy (message/headline/CTA/link), identity (instagram_user_id vs deprecated instagram_actor_id).
 
-## Phase v1.1 Wave 4 - Tracking Diagnostics (7 tools)
+## Phase v1.1 Wave 4 - Tracking Diagnostics (8 tools)
 
 ### get_pixel_info [production-safe]
 Get pixel status, creation time, last fired time, and availability.
@@ -170,6 +170,11 @@ Event volume received by a pixel/dataset over the last few complete days: per ev
 - `include_source_split` (bool, default true): adds browser vs server counts and `server_share_pct` per event (2 extra calls).
 
 Flags (our heuristics, not Meta's): `volume_drop` (the last complete day is 50%+ below the average of the days before it, MEDIUM, or 80%+, HIGH; only for events averaging 20+/day and with 3+ earlier days), `no_server_events` (100+ browser events and no Conversions API events: MEDIUM for Purchase and Lead, otherwise INFO), `no_browser_events` (INFO). Use `get_dataset_quality` for match quality and deduplication.
+
+### list_custom_conversions [production-safe]
+An ad account's custom conversions: name, rule, event type, default value, when each first and last fired, and a status (`active`, `stale` after 30 days without firing, `never_fired`, `unavailable`, `archived`). Each carries `insights_action_type` (`offsite_conversion.custom.<id>`), the exact action type it has in Insights: pass it as `conversion_action_type` to `get_performance_signals` to analyze that conversion's cost and volume.
+- `account_id` (str): Ad account ID.
+- `include_archived` (bool, default false): also list archived conversions.
 
 ## Phase v1.1 Wave 5 - Catalog & Connections (11 tools)
 
@@ -257,6 +262,29 @@ Get Meta's opportunity score (0-100) for an ad account, Meta's recommendations r
 - `explain_history` (bool, default false): With history, include the per-campaign changes that moved the score.
 
 Sections fail independently - a permissions error on recommendations still returns the score. The score is Meta's guidance, not a performance guarantee. Many recommendations can carry the same lift (commonly 1 point each on a high score), so ranking among them is Meta's order. The live score can legitimately differ from the history series (history lags ~2 days); when they are 5+ points apart `history_summary.live_vs_history_note` says so.
+
+## Phase v1.1 Wave 5c - Change History & Delivery Errors (2 tools)
+
+### get_activity_log [production-safe]
+Change history for an ad account: who changed what, and when (budget, status, bid, audience, creative and targeting edits, ad review results, billing events). The same record as the campaign history page in Ads Manager, newest first. Use it to find what changed just before performance moved.
+- `account_id` (str): Ad account ID.
+- `days` (int, default 7, max 90): how far back to look. Meta does not document how long it keeps history, so a long window may return less than asked.
+- `category` (str, optional): ACCOUNT, AD, AD_KEYWORDS, AD_SET, AUDIENCE, BID, BUDGET, CAMPAIGN, DATE, STATUS or TARGETING.
+- `user_id` (str, optional): only changes made by this Facebook user.
+- `object_id` (str, optional): only events whose object is this campaign / ad set / ad / audience. Applied here, not by Meta, so the tool reads further pages (up to 1,000 raw events) to find enough matches.
+- `event_type` (str, optional): only event types containing this text (e.g. 'budget', 'run_status', 'review').
+- `limit` (int, default 100, max 500).
+
+Each event has `time`, `local_time` (account timezone), `actor`, `via` (the app used), `what`, `object`, and `change` (`from` / `to`) when Meta supplies old and new values; budget amounts are as Meta returns them, normally in the currency's smallest unit. `summary` counts events by type and by person. Cut-off lists say so (`truncated`).
+
+### get_delivery_errors [production-safe]
+Campaigns, ad sets and ads Meta has flagged as not delivering properly: effective status `WITH_ISSUES`, `DISAPPROVED` or `PENDING_BILLING_INFO`, with the issue details Meta attaches (code, summary, message, type) and, for ads, its review feedback. Scans a whole account in one call; for one object's full detail use the `get_*_details` tools.
+- `account_id` (str): Ad account ID.
+- `campaign_id` (str, optional): only this campaign, its ad sets and its ads.
+- `levels` (str, default 'campaign,adset,ad').
+- `statuses` (str, optional): effective statuses to treat as a problem.
+
+`summary` counts by level and status and lists the most common reasons. Up to 300 entities per level are read; a longer list is flagged `truncated`. A level that errors is reported under `errors` and never counted as clean.
 
 ## Phase v1.1 Wave 6 - Audiences & Targeting (4 tools)
 
