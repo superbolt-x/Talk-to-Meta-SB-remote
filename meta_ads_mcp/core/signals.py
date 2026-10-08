@@ -480,12 +480,27 @@ def _parse_time(value: Any) -> Optional[datetime]:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _find_silent_active(object_id: str, level: str, time_range: str, total_days: int, recent_days: int,
-                        currency: Optional[str]) -> tuple[list[dict], list[str]]:
-    """ACTIVE campaigns / ad sets / ads that spent nothing in the whole window.
+def _positive_budget(entity: dict) -> tuple[Optional[str], Optional[str]]:
+    """(label, cents) of the first budget that is actually set. Meta returns "0" for the budget a
+    lifetime-budget ad set does not use, which must not read as a budget."""
+    for field, label in (("daily_budget", "daily budget"), ("lifetime_budget", "lifetime budget")):
+        raw = entity.get(field)
+        try:
+            if raw is not None and int(raw) > 0:
+                return label, str(raw)
+        except (TypeError, ValueError):
+            continue
+    return None, None
 
-    Insights returns no rows for an entity that is not delivering, so the scan cannot see one (a $3,000/day
-    campaign whose ad sets are all paused simply never appears). Their status has to be asked for separately.
+
+def _find_silent_active(object_id: str, level: str, recent_dates: list[str], currency: Optional[str],
+                        last_spend: dict[str, str]) -> tuple[list[dict], list[str]]:
+    """ACTIVE campaigns / ad sets / ads that spent nothing in the recent window.
+
+    Insights returns no rows for an entity that is not delivering, so a scan never sees one (a $3,000/day
+    campaign whose ad sets are all paused simply is not there). Judged on the recent window, not the whole
+    one: an entity that spent two weeks ago and nothing since is exactly what this should catch.
+    `last_spend` maps an entity id to the last date it spent, for entities the scan already has history for.
     """
     id_field, _ = LEVEL_ID_FIELDS[level]
     edge = {"campaign": "campaigns", "adset": "adsets", "ad": "ads"}[level]
@@ -499,12 +514,14 @@ def _find_silent_active(object_id: str, level: str, time_range: str, total_days:
         )
     except MetaAPIError as e:
         return [], [f"Could not check for ACTIVE {edge} that are not delivering: {e}"]
-    active = [a for a in res.get("data", []) if isinstance(a, dict) and a.get("id")]
+    # Verify the status that came back rather than trusting the filter: a PAUSED ad set was once returned.
+    active = [a for a in res.get("data", []) if isinstance(a, dict) and a.get("id")
+              and a.get("effective_status") == "ACTIVE"]
     if (res.get("paging") or {}).get("next"):
         notes.append(f"Only the first {MAX_ACTIVE_CHECK} ACTIVE {edge} were checked for delivery.")
 
     now = datetime.combine(_today(), time(12, 0), tzinfo=timezone.utc)
-    grace = timedelta(days=recent_days + 1)
+    grace = timedelta(days=len(recent_dates) + 1)
     candidates = []
     for entity in active:
         start, created = _parse_time(entity.get("start_time")), _parse_time(entity.get("created_time"))
@@ -514,10 +531,11 @@ def _find_silent_active(object_id: str, level: str, time_range: str, total_days:
     if not candidates:
         return [], notes
 
+    window = json.dumps({"since": recent_dates[0], "until": recent_dates[-1]})
     try:
         rows, _ = _insights(
             f"/{object_id}/insights", ["spend", "impressions", id_field],
-            {"level": level, "time_range": time_range, "limit": "500",
+            {"level": level, "time_range": window, "limit": "500",
              "filtering": json.dumps([{"field": f"{level}.id", "operator": "IN", "value": [c["id"] for c in candidates]}])},
         )
     except MetaAPIError as e:
@@ -528,13 +546,14 @@ def _find_silent_active(object_id: str, level: str, time_range: str, total_days:
     for entity in candidates:
         if entity["id"] in delivered:
             continue
-        budget = entity.get("daily_budget") or entity.get("lifetime_budget")
-        kind = "daily budget" if entity.get("daily_budget") else "lifetime budget"
-        detail = f" ({kind} {format_budget_cents_to_currency(budget, currency)})" if budget else ""
+        label, cents = _positive_budget(entity)
+        detail = f" ({label} {format_budget_cents_to_currency(cents, currency)})" if cents else ""
+        since = last_spend.get(entity["id"])
+        when = f"since {since}" if since else f"in the last {len(recent_dates)} days"
         found.append({
             "metric": "not_delivering", "unit": "status check", "assessment": "worse", "severity": "MEDIUM",
             "recent": 0.0, "baseline": 0.0, "change_pct": None, "z_score": None,
-            "message": f"ACTIVE but no spend in the last {total_days} days{detail}. "
+            "message": f"ACTIVE but no spend {when}{detail}. "
                        "Check whether its ad sets or ads are paused, or it is out of budget or rejected.",
             "entity": {"level": level, "id": entity["id"], "name": entity.get("name")},
             "_spend": 0.0,
@@ -738,9 +757,19 @@ def get_performance_signals(
             skipped.append({"id": entity["id"], "name": entity["name"], "reason": reason})
 
     if level != "self":
-        silent, silent_notes = _find_silent_active(object_id, level, time_range, total_days, recent_days,
-                                                   response.get("currency"))
-        anomalies.extend(silent)
+        last_spend = {
+            e["id"]: max((dt for dt, rec in e["days"].items() if rec["spend"] > 0), default=None)
+            for e in entities
+        }
+        silent, silent_notes = _find_silent_active(object_id, level, recent_dates, response.get("currency"),
+                                                   {k: v for k, v in last_spend.items() if v})
+        stopped = {a["entity"]["id"]: a for a in anomalies if a["metric"] == "delivery"}
+        for item in silent:
+            twin = stopped.get(item["entity"]["id"])
+            if twin:  # the scan already reported it stopping; add the one thing it could not know
+                twin["message"] += " It is still ACTIVE."
+            else:
+                anomalies.append(item)
         notes.extend(silent_notes)
     anomalies = _sort_anomalies(anomalies)
     for item in anomalies:
