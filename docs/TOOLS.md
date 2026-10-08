@@ -171,7 +171,7 @@ Event volume received by a pixel/dataset over the last few complete days: per ev
 
 Flags (our heuristics, not Meta's): `volume_drop` (the last complete day is 50%+ below the average of the days before it, MEDIUM, or 80%+, HIGH; only for events averaging 20+/day and with 3+ earlier days), `no_server_events` (100+ browser events and no Conversions API events: MEDIUM for Purchase and Lead, otherwise INFO), `no_browser_events` (INFO). Use `get_dataset_quality` for match quality and deduplication.
 
-## Phase v1.1 Wave 5 - Catalog & Connections (8 tools)
+## Phase v1.1 Wave 5 - Catalog & Connections (11 tools)
 
 ### list_catalogs [production-safe]
 List product catalogs so a catalog ID can be found without already knowing it: catalogs a business owns plus catalogs shared with it, each with product count, feed count, vertical and owning business.
@@ -228,6 +228,24 @@ Check a catalog's feed health: recent upload sessions per feed (accepted vs inva
 - `include_diagnostics` (bool, default true): Include Meta's catalog diagnostic groups.
 
 Needs `catalog_management` and access to the catalog. Sections fail independently. A scheduled feed whose last upload is both over 7 days old and over 10x its interval is rated CRITICAL (`feed looks dead`); otherwise stale means more than 2x the interval (a daily feed 27h old is fine, 49h is not). Staleness uses `schedule`, or `update_schedule` for update-only / supplementary feeds. A feed with products but no visible upload sessions is an info note (`upload_sessions_not_visible`), not a failure. The response includes the catalog's name and counts, and an info note when Meta's `feed_count` is higher than the feeds the feeds edge returns. Feed URLs, usernames and passwords are never returned: schedules keep only the cadence and the host the feed is fetched from (`source_host`); `get_catalog_info` redacts feeds the same way. Upload-quality checks (failed, invalid items, item-count drop, warnings) judge the most recent *completed* upload, because an upload still running reads 0 items and would otherwise hide the previous one's problems on hourly feeds; the error sample comes from the same upload (`errors_from_upload`), and `latest_upload_in_progress` is set when a newer one is running. A feed or file name that is itself a URL is shown as its host only. Beyond schedule staleness it flags an upload that failed before reading any item (`upload_failed`, with Meta's fatal error text as the reason, e.g. an expired feed credential), an unscheduled feed with no upload for 30+ days (`feed_inactive`), and a catalog with only supplementary feeds (`no_primary_feed`, info): its main product data probably comes from an integration such as Shopify, which does not appear as a feed, so these checks cannot tell whether that data is fresh. Staleness is only checked for scheduled feeds (manual/API-fed catalogs have no expected cadence). Flag thresholds (invalid items >= 5% / 20%, item drop >= 20%, 2x missed schedule) are operator heuristics; error and diagnostic text comes from Meta. Generating Meta's full downloadable error report is a POST and is not exposed.
+
+### get_catalog_readiness [production-safe]
+Whether a catalog is healthy enough to serve dynamic / Advantage+ catalog ads, using Meta's own Dynamic Ads checks (for example the pixel missing the product events, events missing required parameters, event volume falling, feed upload errors). A failed check carries Meta's explanation and a link to the Ads Manager page that fixes it.
+- `catalog_id` (str): Product catalog ID.
+- `connection_method` (str, optional): only check events received this way: 'ALL', 'APP', 'BROWSER' or 'SERVER'.
+
+Returns `status` (`ready`, `not_ready` or `unknown` when no check ran), counts, ranked `issues` (a failed check is HIGH, a check Meta could not run is INFO) and every `check`. For feed upload errors it points at `get_catalog_feed_health`. Needs `catalog_management`.
+
+### get_catalog_data_sources [production-safe]
+Where a catalog's products and signals come from: its product feeds (type, schedule, last upload, product count) and its connected event sources (pixels and apps). Feed URLs, usernames and passwords are never returned; schedules show only the cadence and the host. Notes say when there is no primary feed (products probably come from an integration such as Shopify, the Batch API or manual upload, none of which appear as feeds), when no pixel or app is connected, and when Meta's feed count is higher than the feeds listed.
+- `catalog_id` (str): Product catalog ID.
+
+### get_feed_rules [production-safe]
+The supplementary rules applied to a product feed (they map or transform attributes such as title, price or availability), plus Meta's suggested rules for the top errors of the feed's latest *finished* upload (up to 5 errors, fatal first). Suggestions are shown, never applied.
+- `feed_id` (str) or `catalog_id` (str): exactly one; a catalog covers up to 10 of its feeds.
+- `include_suggestions` (bool, default true).
+
+Sections fail independently. Needs `catalog_management`.
 
 ## Phase v1.1 Wave 5b - Opportunity Score (1 tool)
 

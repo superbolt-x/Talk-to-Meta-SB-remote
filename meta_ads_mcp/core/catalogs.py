@@ -1209,3 +1209,258 @@ def list_catalogs(
         )
     response["rate_limit_usage_pct"] = api_client.rate_limits.max_usage_pct
     return response
+
+
+# --- Catalog readiness, data sources and feed rules (read-only) ---
+
+READINESS_FIELDS = ["key", "title", "description", "result", "action_uri", "user_message"]
+VALID_CONNECTION_METHODS = ("ALL", "APP", "BROWSER", "SERVER")
+MAX_RULE_FEEDS = 10
+MAX_SUGGESTION_ERRORS = 5
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_catalog_readiness(catalog_id: str, connection_method: Optional[str] = None) -> dict:
+    """
+    Check whether a catalog is healthy enough to serve dynamic / Advantage+ catalog ads, using Meta's
+    own Dynamic Ads checks (e.g. pixel missing the product events, events missing required parameters,
+    event volume falling, feed upload errors).
+
+    Read-only. Needs the catalog_management permission. A failed check carries Meta's explanation and
+    a link to the Ads Manager page that fixes it. For feed upload errors, use get_catalog_feed_health.
+
+    Args:
+        catalog_id: Product catalog ID.
+        connection_method: Only check events received this way: 'ALL', 'APP', 'BROWSER' or 'SERVER'.
+            Default: Meta's default (all).
+    """
+    api_client._ensure_initialized()
+    catalog_id = str(catalog_id).strip()
+    method = connection_method.strip().upper() if connection_method else None
+    if method and method not in VALID_CONNECTION_METHODS:
+        return {"error": f"connection_method must be one of {', '.join(VALID_CONNECTION_METHODS)}",
+                "blocked_at": "input_validation"}
+
+    try:
+        res = _graph_with_fallback(f"/{catalog_id}/da_checks", READINESS_FIELDS, None,
+                                   params={"connection_method": method} if method else None)
+    except MetaAPIError as e:
+        return {"catalog_id": catalog_id, "error": str(e), "error_code": e.error_code,
+                "hint": "Meta's catalog checks need the catalog_management permission and access to this catalog."}
+
+    checks = []
+    for raw in res.get("data", []):
+        if not isinstance(raw, dict):
+            continue
+        checks.append({
+            "key": raw.get("key"),
+            "title": raw.get("title"),
+            "result": str(raw.get("result", "")).lower() or None,
+            "description": raw.get("description"),
+            "explanation": raw.get("user_message"),
+            "fix_url": raw.get("action_uri"),
+        })
+    rank = {"failed": 0, "unavailable": 1, "passed": 2}
+    checks.sort(key=lambda c: rank.get(c["result"], 3))
+
+    issues = []
+    for c in checks:
+        if c["result"] == "failed":
+            fix = c["description"] or "Open the fix link for Meta's steps."
+            if c["key"] == "catalog_has_feed_upload_errors":
+                fix = "Run get_catalog_feed_health to see the failing uploads and their errors."
+            issues.append({
+                "severity": SEVERITY_HIGH, "check": c["key"],
+                "message": c["title"] + (f": {c['explanation']}" if c["explanation"] else ""),
+                "fix": fix, "fix_url": c["fix_url"],
+            })
+        elif c["result"] == "unavailable":
+            issues.append({"severity": SEVERITY_INFO, "check": c["key"],
+                           "message": f"{c['title']}: Meta could not run this check right now",
+                           "fix": "Retry later.", "fix_url": None})
+
+    counts = {r: sum(1 for c in checks if c["result"] == r) for r in ("passed", "failed", "unavailable")}
+    status = "not_ready" if counts["failed"] else ("ready" if counts["passed"] else "unknown")
+    response: dict[str, Any] = {
+        "catalog_id": catalog_id, "status": status, "counts": counts,
+        "connection_method": method or "default",
+        "issues": issues, "checks": checks,
+        "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
+    }
+    if not checks:
+        response["note"] = ("Meta returned no checks. The catalog may have no connected pixel or app, "
+                            "or no events to check yet.")
+    return response
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_catalog_data_sources(catalog_id: str) -> dict:
+    """
+    List where a catalog's products come from and which pixels or apps feed it signals: its product
+    feeds (type, schedule, last upload, product count) and its connected event sources.
+
+    Feed URLs, usernames and passwords are never returned; schedules show only the cadence and the host
+    the feed is fetched from. Products added by an integration (e.g. Shopify), the Batch API or manual
+    upload do not appear as feeds. Read-only; needs catalog_management.
+
+    Args:
+        catalog_id: Product catalog ID.
+    """
+    api_client._ensure_initialized()
+    catalog_id = str(catalog_id).strip()
+    response: dict[str, Any] = {"catalog_id": catalog_id}
+    errors: dict[str, str] = {}
+
+    try:
+        node = api_client.graph_get(f"/{catalog_id}", fields=["id", "name", "product_count", "feed_count", "vertical"])
+        response["catalog"] = {k: node.get(k) for k in ("id", "name", "product_count", "feed_count", "vertical")}
+    except MetaAPIError:
+        pass
+
+    feeds: list[dict] = []
+    try:
+        raw = _graph_with_fallback(f"/{catalog_id}/product_feeds", FEED_FIELDS_RICH, FEED_FIELDS_BASIC)
+        for feed in (f for f in raw.get("data", []) if isinstance(f, dict)):
+            safe = _sanitize_feed_node(feed)
+            latest = feed.get("latest_upload") if isinstance(feed.get("latest_upload"), dict) else None
+            summary = None
+            if latest:
+                u = _normalize_upload(latest)
+                summary = {k: u[k] for k in ("start_time", "end_time", "completed", "input_method",
+                                             "items_detected", "items_persisted", "items_invalid")}
+            feeds.append({
+                "id": safe.get("id"), "name": safe.get("name"), "file_name": safe.get("file_name"),
+                "type": safe.get("ingestion_source_type"),
+                "product_count": safe.get("product_count", safe.get("item_count")),
+                "schedule": safe.get("schedule"), "update_schedule": safe.get("update_schedule"),
+                "latest_upload": summary,
+            })
+    except MetaAPIError as e:
+        errors["feeds"] = str(e)
+    response["feeds"] = feeds
+
+    sources: list[dict] = []
+    try:
+        res = _graph_with_fallback(f"/{catalog_id}/external_event_sources", ["id", "name", "source_type"], ["id", "name"])
+        sources = [{"id": s.get("id"), "name": s.get("name"), "type": s.get("source_type")}
+                   for s in res.get("data", []) if isinstance(s, dict)]
+    except MetaAPIError as e:
+        errors["event_sources"] = str(e)
+    response["event_sources"] = sources
+
+    notes = []
+    if "feeds" not in errors and (not feeds or all(f["type"] == "SUPPLEMENTARY_FEED" for f in feeds)):
+        notes.append("No primary feed. The catalog's products probably come from an integration (e.g. Shopify), "
+                     "the Batch API or manual upload, which do not appear as feeds.")
+    if "event_sources" not in errors and not sources:
+        notes.append("No pixel or app is connected to this catalog, so catalog ads get no event signals from it.")
+    declared = _int((response.get("catalog") or {}).get("feed_count"))
+    if declared is not None and "feeds" not in errors and declared > len(feeds):
+        notes.append(f"Meta reports {declared} feeds but only {len(feeds)} are visible here; the rest may be "
+                     "managed by an integration or owned by another business.")
+    response["summary"] = {"feeds": len(feeds), "event_sources": len(sources)}
+    if notes:
+        response["notes"] = notes
+    if errors:
+        response["errors"] = errors
+        response["hint"] = ("Meta rejected part of this request. Listing a catalog's sources needs "
+                            "catalog_management and access to this catalog.")
+    response["rate_limit_usage_pct"] = api_client.rate_limits.max_usage_pct
+    return response
+
+
+def _params_dict(params: Any) -> dict:
+    """Meta encodes rule params as a list of {"key", "value"}; return a plain dict."""
+    if isinstance(params, dict):
+        return params
+    if isinstance(params, list):
+        return {p["key"]: p.get("value") for p in params if isinstance(p, dict) and "key" in p}
+    return {}
+
+
+def _normalize_rule(raw: dict) -> dict:
+    return {"id": raw.get("id"), "attribute": raw.get("attribute"),
+            "type": raw.get("type") or raw.get("rule_type"), "params": _params_dict(raw.get("params"))}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_feed_rules(
+    feed_id: Optional[str] = None,
+    catalog_id: Optional[str] = None,
+    include_suggestions: bool = True,
+) -> dict:
+    """
+    List the supplementary rules applied to a product feed (they map or transform attributes such as
+    title, price or availability), and Meta's suggested rules for the errors in its latest finished upload.
+
+    Give a feed_id, or a catalog_id to cover its feeds (up to 10). Read-only: suggested rules are shown,
+    never applied. Needs catalog_management.
+
+    Args:
+        feed_id: Product feed ID (see get_catalog_data_sources).
+        catalog_id: Product catalog ID; covers each of its feeds.
+        include_suggestions: Also fetch Meta's suggested rules for the top errors of the latest finished
+            upload (up to 5 errors, fatal first).
+    """
+    api_client._ensure_initialized()
+    if bool(feed_id) == bool(catalog_id):
+        return {"error": "Give exactly one of feed_id or catalog_id", "blocked_at": "input_validation"}
+
+    errors: dict[str, str] = {}
+    feeds: list[dict] = []
+    if feed_id:
+        feeds = [{"id": str(feed_id).strip()}]
+    else:
+        try:
+            res = _graph_with_fallback(f"/{str(catalog_id).strip()}/product_feeds", ["id", "name"], ["id", "name"])
+            feeds = [f for f in res.get("data", []) if isinstance(f, dict) and f.get("id")][:MAX_RULE_FEEDS]
+        except MetaAPIError as e:
+            return {"catalog_id": catalog_id, "error": str(e), "error_code": e.error_code,
+                    "hint": "Listing a catalog's feeds needs catalog_management and access to this catalog."}
+
+    reports = []
+    for feed in feeds:
+        fid = feed["id"]
+        report: dict[str, Any] = {"feed_id": fid, "name": _safe_label(feed.get("name"))}
+        try:
+            res = _graph_with_fallback(f"/{fid}/rules", ["id", "attribute", "type", "params"], None)
+            report["rules"] = [_normalize_rule(r) for r in res.get("data", []) if isinstance(r, dict)]
+            report["rule_count"] = len(report["rules"])
+        except MetaAPIError as e:
+            errors[f"rules:{fid}"] = str(e)
+
+        if include_suggestions:
+            try:
+                ups = _graph_with_fallback(f"/{fid}/uploads", ["id", "start_time", "end_time"], None, params={"limit": "5"})
+                done = next((u for u in ups.get("data", []) if isinstance(u, dict) and u.get("end_time")), None)
+                if done:
+                    report["suggestions_from_upload"] = done.get("id")
+                    errs = api_client.graph_get(f"/{done['id']}/errors", params={"limit": "25"})
+                    sampled = sorted((e for e in errs.get("data", []) if isinstance(e, dict) and e.get("id")),
+                                     key=lambda e: 0 if str(e.get("severity", "")).lower() == "fatal" else 1)
+                    suggestions = []
+                    for err in sampled[:MAX_SUGGESTION_ERRORS]:
+                        try:
+                            sug = api_client.graph_get(f"/{err['id']}/suggested_rules")
+                        except MetaAPIError:
+                            continue
+                        rules = [{"attribute": s.get("attribute"), "type": s.get("type"),
+                                  "params": _params_dict(s.get("params"))}
+                                 for s in sug.get("data", []) if isinstance(s, dict)]
+                        if rules:
+                            suggestions.append({"error": err.get("summary"),
+                                                "severity": str(err.get("severity", "")).lower() or None,
+                                                "suggested_rules": rules})
+                    report["suggestions"] = suggestions
+            except MetaAPIError as e:
+                errors[f"suggestions:{fid}"] = str(e)
+        reports.append(report)
+
+    response: dict[str, Any] = {"feeds": reports}
+    if not feeds:
+        response["note"] = "This catalog has no product feeds, so there are no feed rules."
+    if errors:
+        response["errors"] = errors
+        response["hint"] = "Meta rejected part of this request. Feed rules need catalog_management and access to the feed."
+    response["rate_limit_usage_pct"] = api_client.rate_limits.max_usage_pct
+    return response
