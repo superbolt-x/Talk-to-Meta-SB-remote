@@ -134,7 +134,7 @@ Get Meta's Dataset Quality for a pixel/dataset (web events): event match quality
 Needs a user/system user with "Use events dataset" access on the pixel (long-lived system user token recommended; client system user tokens are not supported). EMQ exists only for web events with Conversions API data - pixel-only datasets return nothing.
 Issue thresholds (EMQ < 6, event_id < 90% on browser/server events) are operator heuristics; the event coverage goal comes from Meta's response.
 
-## Phase v1.1 Wave 5 - Catalog & Connections (6 tools)
+## Phase v1.1 Wave 5 - Catalog & Connections (7 tools)
 
 ### get_catalog_info [production-safe]
 Get catalog details including product count, connected pixels, product sets, and feeds.
@@ -172,6 +172,16 @@ Update a product set name or filter rules.
 - `product_set_id` (str): Product set ID.
 - `name` (str, optional): New name.
 - `filter_rules` (dict, optional): New filter rules.
+
+### get_catalog_feed_health [production-safe]
+Check a catalog's feed health: recent upload sessions per feed (accepted vs invalid items, item-count drops against the previous upload, staleness against the feed schedule), a sample of the latest upload's errors and warnings (fatal first, with row numbers and retailer IDs), and Meta's catalog-level diagnostics (MUST_FIX vs OPPORTUNITY groups). Returns a health classification and severity-ranked issues.
+- `catalog_id` (str): Product catalog ID.
+- `feed_id` (str, optional): Only check this feed. Default: every feed on the catalog.
+- `upload_limit` (int, default 5, max 10): Recent upload sessions to inspect per feed.
+- `include_errors` (bool, default true): Include the error/warning sample for each feed's latest upload.
+- `include_diagnostics` (bool, default true): Include Meta's catalog diagnostic groups.
+
+Needs `catalog_management` and access to the catalog. Sections fail independently. Staleness is only checked for scheduled feeds (manual/API-fed catalogs have no expected cadence). Flag thresholds (invalid items >= 5% / 20%, item drop >= 20%, 2x missed schedule) are operator heuristics; error and diagnostic text comes from Meta. Generating Meta's full downloadable error report is a POST and is not exposed.
 
 ## Phase v1.1 Wave 5b - Opportunity Score (1 tool)
 
