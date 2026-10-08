@@ -35,8 +35,12 @@ DAILY_FEED = {"id": "f1", "name": "Main feed", "product_count": 1000,
               "schedule": {"interval": "DAILY", "url": "https://shop.example/feed.csv"}}
 
 
-def make_graph(feeds=None, uploads=None, errors=None, diagnostics=None):
+def make_graph(feeds=None, uploads=None, errors=None, diagnostics=None, catalog=None):
     """Fake graph_get routing by endpoint suffix. Values may be dicts or exceptions."""
+    feed_list = feeds if feeds is not None else [DAILY_FEED]
+    catalog_node = catalog if catalog is not None else {
+        "id": "cat1", "name": "Test catalog", "product_count": 1000, "feed_count": len(feed_list),
+        "vertical": "commerce"}
     routes = {
         "/product_feeds": {"data": feeds if feeds is not None else [DAILY_FEED]},
         "/uploads": {"data": uploads if uploads is not None else []},
@@ -45,6 +49,10 @@ def make_graph(feeds=None, uploads=None, errors=None, diagnostics=None):
     }
 
     def fake(endpoint, params=None, fields=None):
+        if endpoint == "/cat1":
+            if isinstance(catalog_node, Exception):
+                raise catalog_node
+            return catalog_node
         for suffix, payload in routes.items():
             if endpoint.endswith(suffix):
                 if isinstance(payload, Exception):
@@ -84,8 +92,9 @@ class TestHealthyAndStale:
         out = run(monkeypatch, feeds=[manual], uploads=[upload("u1", "2026-01-01T00:00:00+0000")])
         assert "feed_stale" not in checks(out)
 
-    def test_no_uploads_is_high(self, monkeypatch):
-        out = run(monkeypatch, uploads=[])
+    def test_empty_feed_with_no_uploads_is_high(self, monkeypatch):
+        empty = {"id": "f1", "name": "Empty", "product_count": 0}
+        out = run(monkeypatch, feeds=[empty], uploads=[])
         assert "feed_never_uploaded" in checks(out)
 
     def test_falls_back_to_latest_upload_embedded_on_feed(self, monkeypatch):
@@ -324,6 +333,153 @@ class TestFailedAndAbandonedFeeds:
         out = run(monkeypatch, uploads=[upload("u1", "2026-08-01T12:00:00+0000")])
         assert "feed_stale" in checks(out)
         assert "feed_inactive" not in checks(out)
+
+
+class TestLiveFindings:
+    """Behaviours found by running the tool against real catalogs."""
+
+    def test_feed_with_products_but_no_visible_uploads_is_not_called_never_uploaded(self, monkeypatch):
+        # Seen live: product_count 85, recent_uploads [] -> was a false HIGH "never uploaded"
+        feed = {"id": "f1", "name": "Shopify-fed", "product_count": 85}
+        out = run(monkeypatch, feeds=[feed], uploads=[])
+        assert "feed_never_uploaded" not in checks(out)
+        note = next(i for i in out["issues"] if i["check"] == "upload_sessions_not_visible")
+        assert note["severity"] == "INFO" and "85 products" in note["message"]
+        assert out["health"] == "healthy"
+
+    def test_update_schedule_counts_when_schedule_is_null(self, monkeypatch):
+        # Seen live: supplementary feeds uploading hourly with schedule null
+        feed = {"id": "f1", "name": "Supplementary", "product_count": 5, "schedule": None,
+                "update_schedule": {"interval": "HOURLY"}}
+        out = run(monkeypatch, feeds=[feed], uploads=[upload("u1", "2026-10-08T01:00:00+0000")])  # 11h old
+        assert "feed_stale" in checks(out)
+        assert "feed_inactive" not in checks(out)
+
+    def test_schedule_urls_and_credentials_are_never_returned(self, monkeypatch):
+        import json
+        feed = {"id": "f1", "name": "SFTP feed", "product_count": 5,
+                "schedule": {"interval": "DAILY", "hour": 18, "timezone": "America/New_York",
+                             "url": "sftp://feeduser:s3cret@feeds.example.com/path/file.csv?token=abc123",
+                             "username": "feeduser", "password": "s3cret"},
+                "update_schedule": {"interval": "HOURLY", "url": "https://docs.google.com/spreadsheets/d/SHEETID/export"}}
+        out = run(monkeypatch, feeds=[feed], uploads=[upload("u1", "2026-10-08T06:00:00+0000")])
+        sched = out["feeds"][0]["schedule"]
+        assert sched == {"interval": "DAILY", "hour": 18, "timezone": "America/New_York",
+                         "source_host": "feeds.example.com"}
+        assert out["feeds"][0]["update_schedule"] == {"interval": "HOURLY", "source_host": "docs.google.com"}
+        blob = json.dumps(out)
+        for secret in ("feeduser", "s3cret", "abc123", "SHEETID", "file.csv"):
+            assert secret not in blob, secret
+
+    def test_get_catalog_info_strips_feed_urls_and_credentials(self, monkeypatch):
+        import json
+        from meta_ads_mcp.core.catalogs import get_catalog_info
+
+        feed = {"id": "f1", "name": "F", "product_count": 5,
+                "schedule": {"interval": "DAILY", "url": "https://u:p@host.example.com/f.csv?k=v", "username": "u"},
+                "latest_upload": {"id": "u1", "url": "https://u:p@host.example.com/f.csv?k=v", "username": "u"}}
+
+        def fake(endpoint, params=None, fields=None):
+            if endpoint.endswith("/product_feeds"):
+                return {"data": [feed]}
+            return {"id": "cat1", "data": []}
+
+        monkeypatch.setattr(api_client, "graph_get", fake)
+        out = get_catalog_info("cat1")
+        blob = json.dumps(out["feeds"])
+        assert "host.example.com" in blob  # the host is kept
+        for secret in ('"u"', ":p@", "k=v", "f.csv", "username"):
+            assert secret not in blob, secret
+
+    def test_very_stale_scheduled_feed_is_critical_and_degrades_health(self, monkeypatch):
+        # Seen live: daily feed last fetched 1986h (83 days) ago was only "partial"
+        out = run(monkeypatch, uploads=[upload("u1", "2026-07-17T12:00:00+0000")])
+        stale = next(i for i in out["issues"] if i["check"] == "feed_stale")
+        assert stale["severity"] == "CRITICAL" and "looks dead" in stale["message"]
+        assert out["health"] == "degraded"
+
+    def test_stale_severity_boundaries(self, monkeypatch):
+        hourly = {"id": "f1", "name": "Hourly", "product_count": 5, "schedule": {"interval": "HOURLY"}}
+        cases = [
+            (DAILY_FEED, "2026-10-06T10:00:00+0000", "HIGH"),      # 50h: stale, not dead
+            (DAILY_FEED, "2026-10-01T10:00:00+0000", "HIGH"),      # 170h > 168h but < 10 x 24h
+            (DAILY_FEED, "2026-09-28T10:00:00+0000", "CRITICAL"),  # 266h >= 240h
+            (hourly, "2026-10-05T12:00:00+0000", "HIGH"),          # 72h: below the 168h floor
+            (hourly, "2026-09-30T12:00:00+0000", "CRITICAL"),      # 192h >= 168h
+        ]
+        for feed, start, severity in cases:
+            out = run(monkeypatch, feeds=[feed], uploads=[upload("u1", start)])
+            stale = next(i for i in out["issues"] if i["check"] == "feed_stale")
+            assert stale["severity"] == severity, (feed["name"], start)
+
+    def test_daily_feed_27h_old_is_not_stale_threshold_is_two_intervals(self, monkeypatch):
+        fresh = run(monkeypatch, uploads=[upload("u1", "2026-10-07T09:00:00+0000")])   # 27h
+        stale = run(monkeypatch, uploads=[upload("u1", "2026-10-06T11:00:00+0000")])   # 49h
+        assert "feed_stale" not in checks(fresh)
+        assert "feed_stale" in checks(stale)
+
+    def test_per_feed_issues_are_sorted_most_severe_first(self, monkeypatch):
+        feed = {"id": "f1", "name": "Ettika-like", "product_count": 0, "schedule": None,
+                "ingestion_source_type": "SUPPLEMENTARY_FEED"}
+        errors = {"data": [{"id": 1, "summary": "HTTP Authentication Failed", "severity": "fatal"}]}
+        out = run(monkeypatch, feeds=[feed], errors=errors,
+                  uploads=[upload("u1", "2026-05-22T10:00:00+0000", detected=0, persisted=0, errors=1)])
+        order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        severities = [i["severity"] for i in out["feeds"][0]["issues"]]
+        assert len(severities) >= 2
+        assert severities == sorted(severities, key=order.get)
+
+    def test_catalog_context_included(self, monkeypatch):
+        out = run(monkeypatch, uploads=[upload("u1", "2026-10-08T06:00:00+0000")])
+        assert out["catalog"]["name"] == "Test catalog"
+        assert out["catalog"]["feed_count"] == 1
+
+    def test_feed_count_mismatch_is_surfaced(self, monkeypatch):
+        # Seen live: catalog says feed_count 3, the feeds edge listed 2
+        node = {"id": "cat1", "name": "JMC", "product_count": 50, "feed_count": 3, "vertical": "commerce"}
+        out = run(monkeypatch, catalog=node, uploads=[upload("u1", "2026-10-08T06:00:00+0000")])
+        note = next(i for i in out["issues"] if i["check"] == "feed_count_mismatch")
+        assert note["severity"] == "INFO" and "3 feeds" in note["message"] and "only 1" in note["message"]
+
+    def test_matching_feed_count_has_no_mismatch_note(self, monkeypatch):
+        out = run(monkeypatch, uploads=[upload("u1", "2026-10-08T06:00:00+0000")])
+        assert "feed_count_mismatch" not in checks(out)
+
+    def test_mismatch_not_reported_when_a_single_feed_was_requested(self, monkeypatch):
+        node = {"id": "cat1", "name": "JMC", "feed_count": 3}
+        from meta_ads_mcp.core.catalogs import get_catalog_feed_health
+
+        def fake(endpoint, params=None, fields=None):
+            if endpoint == "/cat1":
+                return node
+            if endpoint == "/f1":
+                return DAILY_FEED
+            if endpoint.endswith("/uploads"):
+                return {"data": [upload("u1", "2026-10-08T06:00:00+0000")]}
+            return {"data": []}
+
+        monkeypatch.setattr(api_client, "graph_get", fake)
+        out = get_catalog_feed_health("cat1", feed_id="f1")
+        assert "feed_count_mismatch" not in checks(out)
+
+    def test_catalog_context_failure_is_not_fatal(self, monkeypatch):
+        out = run(monkeypatch, catalog=MetaAPIError("(#200) no access", error_code=200),
+                  uploads=[upload("u1", "2026-10-08T06:00:00+0000")])
+        assert "catalog" not in out
+        assert "errors" not in out
+        assert out["health"] == "healthy"
+
+    def test_stray_closing_brace_in_meta_text_is_cleaned(self, monkeypatch):
+        diag = {"data": [
+            {"type": "SHOPS_VISIBILITY_ISSUES", "severity": "MUST_FIX", "title": "Products not being shown",
+             "subtitle": "Add the missing fields }", "number_of_affected_items": 462},
+            {"type": "OTHER", "severity": "OPPORTUNITY", "title": "Keep {placeholder}", "subtitle": "x"},
+        ]}
+        out = run(monkeypatch, uploads=[upload("u1", "2026-10-08T06:00:00+0000")], diagnostics=diag)
+        by_type = {g["type"]: g for g in out["diagnostics"]}
+        assert by_type["SHOPS_VISIBILITY_ISSUES"]["subtitle"] == "Add the missing fields"
+        assert out["issues"][0]["fix"] == "Add the missing fields"
+        assert by_type["OTHER"]["title"] == "Keep {placeholder}"  # balanced braces untouched
 
 
 def test_registered_as_read_only_tool():

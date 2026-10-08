@@ -13,6 +13,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from meta_ads_mcp.server import mcp
 from mcp.types import ToolAnnotations
@@ -74,7 +75,7 @@ def get_catalog_info(catalog_id: str) -> dict:
                 f"/{catalog_id}/product_feeds",
                 fields=["id", "name", "product_count", "latest_upload", "schedule"],
             )
-            result["feeds"] = feeds_result.get("data", [])
+            result["feeds"] = [_sanitize_feed_node(f) for f in feeds_result.get("data", []) if isinstance(f, dict)]
         except MetaAPIError:
             result["feeds"] = []
 
@@ -573,6 +574,8 @@ INVALID_RATIO_CRITICAL = 0.20   # >=20% of detected items invalid in the latest 
 INVALID_RATIO_HIGH = 0.05       # >=5%
 ITEM_DROP_HIGH_PCT = 20.0       # persisted items fell this much vs the previous upload
 MAX_UPLOADS = 10
+FEED_DEAD_MIN_HOURS = 168       # a scheduled feed this stale AND 10x its interval is effectively dead (CRITICAL)
+FEED_DEAD_FACTOR = 10
 UNSCHEDULED_FEED_INACTIVE_DAYS = 30  # no schedule => no expected cadence; this much silence is still worth a note
 MAX_ERROR_SAMPLES = 3           # sample rows/products kept per error
 
@@ -617,6 +620,61 @@ def _int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+SCHEDULE_SAFE_KEYS = ("interval", "interval_count", "hour", "minute", "day_of_week", "timezone")
+
+
+def _url_host(url: Any) -> Optional[str]:
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        return urlparse(url if "//" in url else "//" + url).hostname or None
+    except ValueError:
+        return None
+
+
+def _sanitize_schedule(schedule: Any) -> Any:
+    """A feed schedule without its URL, username or password.
+
+    Feed locations can carry credentials (SFTP usernames, tokens in query strings),
+    so only the cadence and the host the feed is fetched from are returned.
+    """
+    if not isinstance(schedule, dict):
+        return schedule
+    out = {k: schedule[k] for k in SCHEDULE_SAFE_KEYS if k in schedule}
+    host = _url_host(schedule.get("url"))
+    if host:
+        out["source_host"] = host
+    return out
+
+
+def _sanitize_feed_node(feed: dict) -> dict:
+    """A raw ProductFeed node with schedules and the embedded latest upload stripped of URLs/credentials."""
+    out = dict(feed)
+    for key in ("schedule", "update_schedule"):
+        if key in out:
+            out[key] = _sanitize_schedule(out[key])
+    latest = out.get("latest_upload")
+    if isinstance(latest, dict):
+        latest = dict(latest)
+        host = _url_host(latest.pop("url", None))
+        latest.pop("username", None)
+        latest.pop("password", None)
+        if host:
+            latest["source_host"] = host
+        out["latest_upload"] = latest
+    return out
+
+
+def _clean_meta_text(text: Any) -> Any:
+    """Meta's diagnostic text occasionally ends in a stray closing brace from an unfilled template."""
+    if not isinstance(text, str):
+        return text
+    text = text.strip()
+    if text.endswith("}") and "{" not in text:
+        text = text[:-1].rstrip()
+    return text
 
 
 def _schedule_interval_hours(schedule: Any) -> Optional[float]:
@@ -670,8 +728,15 @@ def _assess_feed(feed: dict, uploads: list[dict], now: datetime) -> list[dict]:
         issues.append(_feed_issue(feed, severity, check, message, fix))
 
     if not uploads:
-        add(SEVERITY_HIGH, "feed_never_uploaded", "no upload sessions found",
-            "Check the feed URL/schedule in Commerce Manager and trigger a manual upload.")
+        count = _int(feed.get("product_count")) or _int(feed.get("item_count"))
+        if count:
+            # Items exist, so uploads clearly happened: the sessions probably aged out of what Meta returns.
+            add(SEVERITY_INFO, "upload_sessions_not_visible",
+                f"Meta returned no upload sessions, but the feed has {count} products",
+                "Sessions may have aged out or items arrive another way; check Commerce Manager > Data sources if freshness matters.")
+        else:
+            add(SEVERITY_HIGH, "feed_never_uploaded", "no upload sessions found",
+                "Check the feed URL/schedule in Commerce Manager and trigger a manual upload.")
         return issues
 
     latest = uploads[0]
@@ -679,20 +744,23 @@ def _assess_feed(feed: dict, uploads: list[dict], now: datetime) -> list[dict]:
     ended = _parse_meta_time(latest["end_time"])
 
     # Staleness: scheduled feeds only; a manual/API feed has no expected cadence.
-    interval = _schedule_interval_hours(feed.get("schedule"))
+    # `update_schedule` is how update-only / supplementary feeds are scheduled.
+    interval = _schedule_interval_hours(feed.get("schedule") or feed.get("update_schedule"))
     reference = ended or started
     if interval and reference:
         age_h = (now - reference).total_seconds() / 3600
         if age_h > interval * FEED_STALE_FACTOR:
-            add(SEVERITY_HIGH, "feed_stale",
-                f"last upload {age_h:.0f}h ago, schedule expects one every {interval:.0f}h",
+            dead = age_h >= max(FEED_DEAD_MIN_HOURS, interval * FEED_DEAD_FACTOR)
+            add(SEVERITY_CRITICAL if dead else SEVERITY_HIGH, "feed_stale",
+                f"last upload {age_h:.0f}h ago, schedule expects one every {interval:.0f}h"
+                + (" (feed looks dead)" if dead else ""),
                 "Confirm the feed URL is reachable and returns the file; check fetch errors in Commerce Manager.")
 
     elif reference and not interval:
         age_d = (now - reference).total_seconds() / 86400
         if age_d >= UNSCHEDULED_FEED_INACTIVE_DAYS:
             add(SEVERITY_LOW, "feed_inactive",
-                f"no upload for {age_d:.0f} days and no schedule is configured",
+                f"no upload for {age_d:.0f} days and no schedule is currently set",
                 "If this feed should be refreshing, add a schedule; if it was replaced, remove it from Commerce Manager.")
 
     if latest["completed"] and not latest["items_detected"] and (latest["error_count"] or 0) > 0:
@@ -796,6 +864,17 @@ def get_catalog_feed_health(
     errors: dict[str, str] = {}
     issues: list[dict] = []
 
+    # --- Catalog context (name, counts); best effort, not a health check in itself ---
+    declared_feed_count: Optional[int] = None
+    try:
+        node = api_client.graph_get(
+            f"/{catalog_id}", fields=["id", "name", "product_count", "feed_count", "vertical"],
+        )
+        response["catalog"] = {k: node.get(k) for k in ("id", "name", "product_count", "feed_count", "vertical")}
+        declared_feed_count = _int(node.get("feed_count"))
+    except MetaAPIError:
+        pass
+
     # --- Feeds ---
     feeds: list[dict] = []
     try:
@@ -815,7 +894,8 @@ def get_catalog_feed_health(
             "name": feed.get("name"),
             "file_name": feed.get("file_name"),
             "ingestion_source_type": feed.get("ingestion_source_type"),
-            "schedule": feed.get("schedule"),
+            "schedule": _sanitize_schedule(feed.get("schedule")),
+            "update_schedule": _sanitize_schedule(feed.get("update_schedule")),
             "product_count": feed.get("product_count", feed.get("item_count")),
         }
 
@@ -864,6 +944,8 @@ def get_catalog_feed_health(
                     failed["message"] += f": {fatal['summary']}"
             except MetaAPIError as e:
                 errors[f"errors:{fid}"] = str(e)
+        if "issues" in report:
+            report["issues"].sort(key=lambda i: _SEVERITY_ORDER.get(i["severity"], 5))
         feed_reports.append(report)
 
     response["feeds"] = feed_reports
@@ -872,6 +954,14 @@ def get_catalog_feed_health(
             "severity": SEVERITY_INFO, "check": "feed_exists", "feed_id": None,
             "message": "No product feed on this catalog. It may be managed manually, via Shops, or a partner integration.",
             "fix": "Nothing to check here; use get_catalog_products for item-level status.",
+        })
+
+    if declared_feed_count is not None and not feed_id and "feeds" not in errors and declared_feed_count > len(feeds):
+        issues.append({
+            "severity": SEVERITY_INFO, "check": "feed_count_mismatch", "feed_id": None,
+            "message": f"Meta reports {declared_feed_count} feeds on this catalog but only {len(feeds)} are visible "
+                       "through the feeds edge; the rest may be managed by an integration or owned by another business.",
+            "fix": "Check Commerce Manager > Data sources for the feeds not listed here.",
         })
 
     if feeds and all(f.get("ingestion_source_type") == "SUPPLEMENTARY_FEED" for f in feeds):
@@ -891,8 +981,8 @@ def get_catalog_feed_health(
                 {
                     "type": g.get("type"),
                     "severity": g.get("severity"),
-                    "title": g.get("title"),
-                    "subtitle": g.get("subtitle"),
+                    "title": _clean_meta_text(g.get("title")),
+                    "subtitle": _clean_meta_text(g.get("subtitle")),
                     "affected_items": _int(g.get("number_of_affected_items")),
                     "affected_entity": g.get("affected_entity"),
                     "affected_channels": g.get("affected_channels"),
@@ -943,6 +1033,39 @@ def get_catalog_feed_health(
 CATALOG_LIST_FIELDS = ["id", "name", "product_count", "feed_count", "vertical", "business{id,name}"]
 CATALOG_LIST_FIELDS_BASIC = ["id", "name", "product_count", "vertical"]
 MAX_BUSINESSES = 20
+MAX_CATALOGS_PER_EDGE = 500
+
+
+def _fetch_catalog_edge(business_id: str, edge: str, limit: int) -> tuple[list[dict], bool]:
+    """Up to `limit` catalogs from one business edge, following cursors.
+
+    Returns (catalogs, more_exist). Falls back to a smaller field set if Meta rejects a field.
+    """
+    endpoint = f"/{business_id}/{edge}"
+    params = {"limit": str(min(limit, 100))}
+    fields = CATALOG_LIST_FIELDS
+    collected: list[dict] = []
+    for _ in range(MAX_CATALOGS_PER_EDGE // 100 + 2):  # hard stop; real exits are below
+        try:
+            res = api_client.graph_get(endpoint, fields=fields, params=params)
+        except MetaAPIError as e:
+            if e.error_code == 100 and fields is CATALOG_LIST_FIELDS:
+                fields = CATALOG_LIST_FIELDS_BASIC
+                continue
+            raise
+        page = [c for c in res.get("data", []) if isinstance(c, dict)]
+        collected.extend(page)
+        paging = res.get("paging") or {}
+        has_next = bool(paging.get("next"))
+        cursor = (paging.get("cursors") or {}).get("after")
+        if len(collected) >= limit:
+            return collected[:limit], has_next or len(collected) > limit
+        if not page or not has_next:
+            return collected, False
+        if not cursor:
+            return collected, True
+        params["after"] = cursor
+    return collected, True
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -969,10 +1092,11 @@ def list_catalogs(
         business_id: Business ID to list catalogs for.
         account_id: Ad account ID; its owning business is used.
         include_shared: Also include catalogs shared with the business (default True).
-        limit: Max catalogs per business and relation, 1-100 (default 50).
+        limit: Max catalogs per business and relation, 1-500 (default 50). Pages through
+            Meta's results up to this many.
     """
     api_client._ensure_initialized()
-    limit = max(1, min(int(limit), 100))
+    limit = max(1, min(int(limit), MAX_CATALOGS_PER_EDGE))
     errors: dict[str, str] = {}
     note_parts: list[str] = []
 
@@ -1008,22 +1132,19 @@ def list_catalogs(
         relations.append(("shared", "client_product_catalogs"))
 
     by_id: dict[str, dict] = {}
-    more_exist = False
+    truncated_edges: list[str] = []
     for biz in businesses:
         bid = biz["id"]
         for relation, edge in relations:
             try:
-                res = _graph_with_fallback(
-                    f"/{bid}/{edge}", CATALOG_LIST_FIELDS, CATALOG_LIST_FIELDS_BASIC,
-                    params={"limit": str(limit)},
-                )
+                found, more = _fetch_catalog_edge(bid, edge, limit)
             except MetaAPIError as e:
                 errors[f"{bid}:{relation}"] = str(e)
                 continue
-            if (res.get("paging") or {}).get("next"):
-                more_exist = True
-            for cat in res.get("data", []):
-                if not isinstance(cat, dict) or not cat.get("id"):
+            if more:
+                truncated_edges.append(f"{bid}:{relation}")
+            for cat in found:
+                if not cat.get("id"):
                     continue
                 entry = by_id.setdefault(cat["id"], {
                     "id": cat["id"],
@@ -1040,12 +1161,16 @@ def list_catalogs(
     response: dict[str, Any] = {
         "total": len(catalogs),
         "businesses_checked": businesses,
-        **truncation_fields(
-            {"next": "more"} if more_exist else None, len(catalogs),
-            narrow_hint="Pass a single business_id, or raise limit (max 100), to see the rest.",
-        ),
+        "truncated": bool(truncated_edges),
         "catalogs": catalogs,
     }
+    if truncated_edges:
+        response["truncated_edges"] = truncated_edges
+        response["truncation_note"] = (
+            f"Reached the limit of {limit} per business and relation on {', '.join(truncated_edges)}, "
+            f"so more catalogs exist than are listed. Raise limit (max {MAX_CATALOGS_PER_EDGE}) "
+            "or pass a single business_id."
+        )
     if account_id:
         response["account_id"] = account_id
     if note_parts:
