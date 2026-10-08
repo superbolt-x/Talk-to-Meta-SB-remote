@@ -34,7 +34,12 @@ from typing import Optional
 from meta_ads_mcp.server import mcp
 from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
-from meta_ads_mcp.core.utils import ensure_account_id_format, format_budget_cents_to_currency, currency_to_cents
+from meta_ads_mcp.core.utils import (
+    ensure_account_id_format,
+    format_budget_cents_to_currency,
+    currency_to_cents,
+    get_account_currency,
+)
 
 logger = logging.getLogger("meta-ads-mcp.adsets")
 
@@ -59,7 +64,7 @@ ADSET_LIST_FIELDS = [
 
 # Fields for detail view
 ADSET_DETAIL_FIELDS = ADSET_LIST_FIELDS + [
-    "targeting", "promoted_object",
+    "account_id", "targeting", "promoted_object",
     "budget_remaining", "bid_amount",
     "frequency_control_specs", "pacing_type",
     "destination_type", "attribution_spec",
@@ -95,6 +100,8 @@ def get_adsets(
         if status_val in valid_statuses:
             params["filtering"] = f'[{{"field":"effective_status","operator":"IN","value":["{status_val}"]}}]'
 
+    currency = get_account_currency(account_id)
+
     # Choose endpoint: campaign-scoped or account-scoped
     if campaign_id:
         endpoint = f"/{campaign_id}/adsets"
@@ -113,9 +120,9 @@ def get_adsets(
         # Enrich with human-readable budget
         for a in adsets:
             if a.get("daily_budget"):
-                a["daily_budget_display"] = format_budget_cents_to_currency(a["daily_budget"])
+                a["daily_budget_display"] = format_budget_cents_to_currency(a["daily_budget"], currency)
             if a.get("lifetime_budget"):
-                a["lifetime_budget_display"] = format_budget_cents_to_currency(a["lifetime_budget"])
+                a["lifetime_budget_display"] = format_budget_cents_to_currency(a["lifetime_budget"], currency)
 
         # Paginate up to 200
         all_adsets = list(adsets)
@@ -131,9 +138,9 @@ def get_adsets(
                 break
             for a in next_adsets:
                 if a.get("daily_budget"):
-                    a["daily_budget_display"] = format_budget_cents_to_currency(a["daily_budget"])
+                    a["daily_budget_display"] = format_budget_cents_to_currency(a["daily_budget"], currency)
                 if a.get("lifetime_budget"):
-                    a["lifetime_budget_display"] = format_budget_cents_to_currency(a["lifetime_budget"])
+                    a["lifetime_budget_display"] = format_budget_cents_to_currency(a["lifetime_budget"], currency)
             all_adsets.extend(next_adsets)
             paging = result.get("paging", {})
 
@@ -146,6 +153,7 @@ def get_adsets(
         return {
             "total": len(all_adsets),
             "status_counts": status_counts,
+            "currency": currency,
             "adsets": all_adsets,
             "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
         }
@@ -171,11 +179,13 @@ def get_adset_details(adset_id: str) -> dict:
             fields=ADSET_DETAIL_FIELDS,
         )
 
-        # Enrich budget display
+        # Enrich budget display in the account's own currency
+        currency = get_account_currency(result.get("account_id"))
+        result["currency"] = currency
         if result.get("daily_budget"):
-            result["daily_budget_display"] = format_budget_cents_to_currency(result["daily_budget"])
+            result["daily_budget_display"] = format_budget_cents_to_currency(result["daily_budget"], currency)
         if result.get("lifetime_budget"):
-            result["lifetime_budget_display"] = format_budget_cents_to_currency(result["lifetime_budget"])
+            result["lifetime_budget_display"] = format_budget_cents_to_currency(result["lifetime_budget"], currency)
 
         # Get child ad count
         try:
@@ -261,8 +271,8 @@ def create_adset(
         optimization_goal: e.g. 'OFFSITE_CONVERSIONS', 'LINK_CLICKS', 'LEAD_GENERATION', 'REACH'.
             Must be compatible with parent campaign objective.
         billing_event: Usually 'IMPRESSIONS'. Also: 'LINK_CLICKS', 'THRUPLAY'.
-        daily_budget: Daily budget in EUR (e.g., 15.00). Required for ABO campaigns. Omit for CBO.
-        lifetime_budget: Lifetime budget in EUR. Alternative to daily_budget. Requires end_time.
+        daily_budget: Daily budget in the account's currency (e.g., 15.00). Required for ABO campaigns. Omit for CBO.
+        lifetime_budget: Lifetime budget in the account's currency. Alternative to daily_budget. Requires end_time.
         targeting_json: JSON string of targeting spec. Advantage+ mode uses signals as suggestions.
             Example: '{"geo_locations":{"countries":["GR"]},"age_min":25,"age_max":55}'
         promoted_object_json: JSON string of promoted object. Required for OUTCOME_SALES/LEADS.
@@ -800,10 +810,11 @@ def create_adset(
     # ============================================================
 
     budget_display = "none (CBO)"
+    budget_currency = get_account_currency(account_id) or "account currency"
     if daily_budget is not None:
-        budget_display = f"EUR {daily_budget:.2f}/day (ABO)"
+        budget_display = f"{budget_currency} {daily_budget:.2f}/day (ABO)"
     elif lifetime_budget is not None:
-        budget_display = f"EUR {lifetime_budget:.2f} lifetime (ABO)"
+        budget_display = f"{budget_currency} {lifetime_budget:.2f} lifetime (ABO)"
 
     aa_status = audience_strategy.get("advantage_plus_status", "unknown")
     log_entry = (
@@ -885,7 +896,7 @@ def update_adset(
         name: New ad set name. Subject to naming enforcement.
         status: New status. Allowed: 'PAUSED', 'ACTIVE', 'ARCHIVED'.
             Activating requires confirmation-level validation.
-        daily_budget: New daily budget in currency units (e.g., 15.0 for EUR 15).
+        daily_budget: New daily budget in currency units (e.g., 15.0 for 15.00 in the account's currency).
             Only allowed for ABO ad sets. Mutually exclusive with lifetime_budget.
         lifetime_budget: New lifetime budget in currency units.
             Only allowed for ABO ad sets. Mutually exclusive with daily_budget.

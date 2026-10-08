@@ -20,10 +20,46 @@ def ensure_account_id_format(account_id: str) -> str:
     return account_id
 
 
-def format_budget_cents_to_currency(cents: int | str, currency: str = "EUR") -> str:
-    """Convert Meta API budget (in cents) to human-readable currency string."""
+_ACCOUNT_CURRENCY_CACHE: dict[str, str] = {}
+
+
+def get_account_currency(account_id: Optional[str]) -> Optional[str]:
+    """Return the ISO currency code (e.g. 'USD') of an ad account, or None if unknown.
+
+    An account's currency is fixed once spend exists, so successful lookups are
+    cached for the life of the process. Failed lookups are not cached and return
+    None, so callers fall back to an unlabelled amount instead of a wrong label.
+    """
+    if not account_id:
+        return None
+    account_id = ensure_account_id_format(str(account_id))
+    cached = _ACCOUNT_CURRENCY_CACHE.get(account_id)
+    if cached:
+        return cached
+
+    # Imported lazily: api.py has no dependency on utils, keep it that way.
+    from meta_ads_mcp.core.api import api_client, MetaAPIError
+
+    try:
+        result = api_client.graph_get(f"/{account_id}", fields=["currency"])
+    except MetaAPIError as e:
+        logger.warning("Could not resolve currency for %s: %s", account_id, e)
+        return None
+
+    currency = result.get("currency")
+    if currency:
+        _ACCOUNT_CURRENCY_CACHE[account_id] = currency
+    return currency or None
+
+
+def format_budget_cents_to_currency(cents: int | str, currency: Optional[str] = None) -> str:
+    """Convert Meta API budget (in cents) to a human-readable string.
+
+    Pass the account's currency (see get_account_currency). With no currency the
+    amount is returned unlabelled rather than guessing one.
+    """
     value = int(cents) / 100
-    return f"{currency} {value:.2f}"
+    return f"{currency} {value:.2f}" if currency else f"{value:.2f}"
 
 
 def currency_to_cents(amount: float) -> str:

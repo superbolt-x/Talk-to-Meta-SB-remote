@@ -10,6 +10,7 @@ gaps, stale feeds, rejected products, and ecommerce readiness issues.
 Phase: v1.1 (Read) / v1.3 (Write)
 """
 import logging
+import re
 from typing import Any, Optional
 
 from meta_ads_mcp.server import mcp
@@ -133,8 +134,8 @@ def get_catalog_products(
             price_str = p.get("price", "")
             if price_str:
                 try:
-                    # Price format: "€33.00" or "33.00 EUR" or just "3300"
-                    cleaned = price_str.replace("€", "").replace("EUR", "").replace(",", ".").strip()
+                    # Price format: "€33.00", "$33.00", "33.00 USD" or just "3300"
+                    cleaned = re.sub(r"[^\d.,-]", "", price_str).replace(",", ".").strip()
                     price_val = float(cleaned)
                     if price_val > 500:  # Likely in cents
                         price_val /= 100
@@ -153,7 +154,7 @@ def get_catalog_products(
                 "min": round(min(price_values), 2),
                 "max": round(max(price_values), 2),
                 "avg": round(sum(price_values) / len(price_values), 2),
-                "currency": products[0].get("currency", "EUR") if products else "EUR",
+                "currency": products[0].get("currency") if products else None,
             }
 
         return {

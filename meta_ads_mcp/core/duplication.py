@@ -60,7 +60,7 @@ def duplicate_campaign(
         name_suffix: Appended to source names (default " - Copy").
             Must result in valid names per naming convention.
         include_adsets: Whether to duplicate child ad sets (default True).
-        adset_budget_override: Override all duplicated ad set budgets (EUR).
+        adset_budget_override: Override all duplicated ad set budgets (account currency).
             Only applies to ABO campaigns. If None, copies source budgets.
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -523,7 +523,7 @@ def duplicate_adset(
         target_campaign_id: Campaign to place the duplicated ad set in.
         account_id: Ad account ID (must match source).
         name_suffix: Appended to source name (default " - Copy").
-        budget_override: Override budget in EUR. If None, copies source budget.
+        budget_override: Override budget in the account's currency. If None, copies source budget.
     """
     account_id = ensure_account_id_format(account_id)
     api_client._ensure_initialized()
