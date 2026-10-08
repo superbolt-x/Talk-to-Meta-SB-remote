@@ -119,7 +119,7 @@ Get full creative spec with mode classification, media extraction, copy parsing,
 
 Returns: creative_mode, media (images/videos with URLs), copy (message/headline/CTA/link), identity (instagram_user_id vs deprecated instagram_actor_id).
 
-## Phase v1.1 Wave 4 - Tracking Diagnostics (6 tools)
+## Phase v1.1 Wave 4 - Tracking Diagnostics (7 tools)
 
 ### get_pixel_info [production-safe]
 Get pixel status, creation time, last fired time, and availability.
@@ -160,6 +160,16 @@ Get Meta's Dataset Quality for a pixel/dataset (web events): event match quality
 
 Needs a user/system user with "Use events dataset" access on the pixel (long-lived system user token recommended; client system user tokens are not supported). EMQ exists only for web events with Conversions API data - pixel-only datasets return nothing.
 Issue thresholds (EMQ < 6, event_id < 90% on browser/server events) are operator heuristics; the event coverage goal comes from Meta's response.
+
+### get_dataset_stats [production-safe]
+Event volume received by a pixel/dataset over the last few complete days: per event and per day, with a browser (pixel) vs server (Conversions API) split and flags for sudden drops. Days are UTC; today, a partial day, is shown separately as `today_so_far` and never counted in totals.
+- `pixel_id` (str): Pixel / dataset ID (numeric).
+- `days` (int, default 6, max 6): complete days to include. Meta keeps about 7 days of pixel stats, so 6 is the most that can be requested. Meta's own connector advertises 28 days; the public stats service documents 7.
+- `events` (str, optional): comma-separated event names (case-insensitive). Default: the top events by volume.
+- `top_n` (int, default 15, max 50).
+- `include_source_split` (bool, default true): adds browser vs server counts and `server_share_pct` per event (2 extra calls).
+
+Flags (our heuristics, not Meta's): `volume_drop` (the last complete day is 50%+ below the average of the days before it, MEDIUM, or 80%+, HIGH; only for events averaging 20+/day and with 3+ earlier days), `no_server_events` (100+ browser events and no Conversions API events: MEDIUM for Purchase and Lead, otherwise INFO), `no_browser_events` (INFO). Use `get_dataset_quality` for match quality and deduplication.
 
 ## Phase v1.1 Wave 5 - Catalog & Connections (8 tools)
 

@@ -794,3 +794,207 @@ def _dataset_quality_error(pixel_id: str, error: MetaAPIError) -> dict:
         "error_code": error.error_code,
         "hint": hint,
     }
+
+
+# --- Event volume history (/{pixel}/stats) ---
+
+# Meta keeps about 7 days of pixel stats ("seven days from the request time"), and today is a partial
+# day, so 6 complete days is the most that can be requested. (Meta's own connector advertises 28 days;
+# the public stats service documents 7.)
+MAX_STATS_DAYS = 6
+MAX_STATS_PAGES = 10
+# Operator heuristics for flagging, NOT Meta-published thresholds.
+MIN_DAILY_EVENTS_FOR_DROP = 20  # below this, day-to-day swings are noise
+DROP_MEDIUM_PCT = 50.0          # last complete day this far below the prior days' average
+DROP_HIGH_PCT = 80.0
+MIN_EVENTS_FOR_SPLIT_FLAG = 100  # window total before a missing web/server channel is worth mentioning
+CORE_EVENTS = ("Purchase", "Lead")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _bucket_date(bucket: dict) -> Optional[str]:
+    raw = bucket.get("start_time")
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("+0000", "+00:00").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc).date().isoformat()
+
+
+def _stats_buckets(pixel_id: str, params: dict) -> list[dict]:
+    """All hourly stats buckets for a request, following cursors."""
+    buckets: list[dict] = []
+    params = dict(params)
+    for _ in range(MAX_STATS_PAGES):
+        res = api_client.graph_get(f"/{pixel_id}/stats", params=params)
+        buckets.extend(b for b in res.get("data", []) if isinstance(b, dict))
+        paging = res.get("paging") or {}
+        cursor = (paging.get("cursors") or {}).get("after")
+        if not paging.get("next") or not cursor:
+            break
+        params["after"] = cursor
+    return buckets
+
+
+def _daily_event_counts(buckets: list[dict]) -> dict[str, dict[str, int]]:
+    """{event: {YYYY-MM-DD (UTC): count}} from hourly buckets."""
+    out: dict[str, dict[str, int]] = {}
+    for bucket in buckets:
+        day = _bucket_date(bucket)
+        if not day:
+            continue
+        for item in bucket.get("data", []) or []:
+            name = item.get("value")
+            try:
+                count = int(float(item.get("count", 0)))
+            except (TypeError, ValueError):
+                continue
+            if name:
+                per_day = out.setdefault(str(name), {})
+                per_day[day] = per_day.get(day, 0) + count
+    return out
+
+
+def _assess_event_volume(name: str, per_day: dict[str, int], days: list[str], split: Optional[dict]) -> list[dict]:
+    issues: list[dict] = []
+    last, prior = per_day[days[-1]], [per_day[d] for d in days[:-1]]
+    if len(prior) >= 3:
+        prior_avg = sum(prior) / len(prior)
+        if prior_avg >= MIN_DAILY_EVENTS_FOR_DROP:
+            drop = (prior_avg - last) / prior_avg * 100
+            if drop >= DROP_MEDIUM_PCT:
+                issues.append({
+                    "severity": SEVERITY_HIGH if drop >= DROP_HIGH_PCT else SEVERITY_MEDIUM,
+                    "check": "volume_drop", "event": name,
+                    "message": f"{name}: {last} events on {days[-1]} vs {prior_avg:.0f}/day over the {len(prior)} days before ({-drop:.0f}%)",
+                    "fix": "Check the pixel and Conversions API sending this event: a site change, a consent banner or a broken integration are the usual causes.",
+                })
+    if split:
+        web, server = split["web"], split["server"]
+        if web >= MIN_EVENTS_FOR_SPLIT_FLAG and server == 0:
+            issues.append({
+                "severity": SEVERITY_MEDIUM if name in CORE_EVENTS else SEVERITY_INFO,
+                "check": "no_server_events", "event": name,
+                "message": f"{name}: {web} browser events and no server (Conversions API) events in the window",
+                "fix": "Send this event through the Conversions API too, with a shared event_id so Meta can deduplicate it.",
+            })
+        elif server >= MIN_EVENTS_FOR_SPLIT_FLAG and web == 0:
+            issues.append({
+                "severity": SEVERITY_INFO, "check": "no_browser_events", "event": name,
+                "message": f"{name}: {server} server events and no browser events in the window",
+                "fix": "Fine for a server-only setup. Otherwise check that the browser pixel fires this event.",
+            })
+    return issues
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_dataset_stats(
+    pixel_id: str,
+    days: int = MAX_STATS_DAYS,
+    events: Optional[str] = None,
+    top_n: int = 15,
+    include_source_split: bool = True,
+) -> dict:
+    """
+    Event volume received by a pixel/dataset over the last few complete days, per event and per day,
+    with a browser (pixel) vs server (Conversions API) split and flags for sudden drops.
+
+    Meta keeps about 7 days of pixel stats, so at most 6 complete days (today, a partial day, is
+    reported separately). Days are UTC. Counts are events received from each source; use
+    get_dataset_quality for deduplication and match quality.
+
+    Args:
+        pixel_id: Pixel / dataset ID (numeric string).
+        days: Complete days to include, 1-6 (default 6).
+        events: Comma-separated event names to show (e.g. 'Purchase,Lead'). Default: the top events by volume.
+        top_n: How many events to show when `events` is not given (default 15, max 50).
+        include_source_split: Also split each event into browser vs server counts (2 extra calls).
+    """
+    api_client._ensure_initialized()
+    pixel_id = str(pixel_id).strip()
+    if not pixel_id.isdigit():
+        return {"error": "pixel_id must be a numeric pixel/dataset ID", "blocked_at": "input_validation"}
+    if not 1 <= int(days) <= MAX_STATS_DAYS:
+        return {"error": f"days must be between 1 and {MAX_STATS_DAYS}: Meta keeps about 7 days of pixel stats",
+                "blocked_at": "input_validation"}
+    days = int(days)
+    top_n = max(1, min(int(top_n), 50))
+
+    now = _utc_now()
+    today = now.date()
+    day_list = [(today - timedelta(days=i)).isoformat() for i in range(days, 0, -1)]  # oldest first, complete days
+    start = datetime(today.year, today.month, today.day, tzinfo=timezone.utc) - timedelta(days=days)
+    base = {"aggregation": "event", "start_time": str(int(start.timestamp())), "end_time": str(int(now.timestamp()))}
+
+    try:
+        counts = _daily_event_counts(_stats_buckets(pixel_id, base))
+    except MetaAPIError as e:
+        return {
+            "pixel_id": pixel_id, "error": str(e), "error_code": e.error_code,
+            "hint": "Reading pixel stats needs ads_read and access to this pixel; Meta returns only about the last 7 days.",
+        }
+
+    notes: list[str] = []
+    split_totals: dict[str, dict[str, int]] = {}
+    if include_source_split and counts:
+        sources = {}
+        try:
+            for label, source in (("web", "WEB_ONLY"), ("server", "SERVER_ONLY")):
+                per_event = _daily_event_counts(_stats_buckets(pixel_id, {**base, "event_source": source}))
+                sources[label] = {n: sum(d.get(day, 0) for day in day_list) for n, d in per_event.items()}
+            for name in counts:
+                split_totals[name] = {"web": sources["web"].get(name, 0), "server": sources["server"].get(name, 0)}
+        except MetaAPIError as e:
+            notes.append(f"Browser vs server split unavailable: {e}")
+
+    wanted = [e.strip().lower() for e in events.split(",") if e.strip()] if events else None
+    shown = []
+    for name, per_day_raw in counts.items():
+        if wanted is not None and name.lower() not in wanted:
+            continue
+        per_day = {d: per_day_raw.get(d, 0) for d in day_list}
+        shown.append((name, per_day, per_day_raw.get(today.isoformat(), 0)))
+    shown.sort(key=lambda item: -sum(item[1].values()))
+    if wanted is None:
+        shown = shown[:top_n]
+
+    issues: list[dict] = []
+    event_reports = []
+    for name, per_day, today_so_far in shown:
+        total = sum(per_day.values())
+        split = split_totals.get(name)
+        entry: dict[str, Any] = {
+            "event": name, "total": total, "avg_per_day": round(total / days, 1),
+            "per_day": per_day, "today_so_far": today_so_far,
+        }
+        if split:
+            entry["by_source"] = {**split, "server_share_pct": (round(split["server"] / (split["web"] + split["server"]) * 100, 1)
+                                                                 if split["web"] + split["server"] else None)}
+        entry_issues = _assess_event_volume(name, per_day, day_list, split)
+        issues.extend(entry_issues)
+        event_reports.append(entry)
+
+    order = {SEVERITY_CRITICAL: 0, SEVERITY_HIGH: 1, SEVERITY_MEDIUM: 2, SEVERITY_LOW: 3, SEVERITY_INFO: 4}
+    issues.sort(key=lambda i: order.get(i["severity"], 5))
+    response: dict[str, Any] = {
+        "pixel_id": pixel_id,
+        "window": {"from": day_list[0], "to": day_list[-1], "days": days, "timezone": "UTC", "today_partial": today.isoformat()},
+        "event_count": len(event_reports),
+        "issue_count": len(issues),
+        "issues": issues,
+        "events": event_reports,
+        "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
+    }
+    if notes:
+        response["notes"] = notes
+    if not counts:
+        response["note"] = ("Meta returned no events for this window. The pixel may be new or inactive, "
+                            "or the token may not have access to it.")
+    elif wanted is not None and not event_reports:
+        response["note"] = f"None of the requested events were received: {events}"
+    return response
