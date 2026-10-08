@@ -256,6 +256,76 @@ class TestFallbacksAndPartialFailure:
         assert limits == [str(catalogs.MAX_UPLOADS)]
 
 
+class TestFailedAndAbandonedFeeds:
+    """Shape seen on a real catalog: supplementary feed, no schedule, uploads failing since May."""
+
+    ETTIKA_FEED = {"id": "f1", "name": "Meta Multi Treatment", "product_count": 0,
+                   "schedule": None, "ingestion_source_type": "SUPPLEMENTARY_FEED"}
+    AUTH_ERROR = {"summary": {"total_count": 1}, "data": [
+        {"id": 1, "summary": "HTTP Authentication Failed", "severity": "fatal",
+         "description": "Meta could not log in to your feed URL.", "samples": {"data": []}}]}
+
+    def failed_upload(self, uid, start, **kw):
+        return upload(uid, start, detected=0, persisted=0, invalid=0, errors=kw.get("errors", 1))
+
+    def test_failed_upload_is_flagged_with_the_fatal_reason(self, monkeypatch):
+        out = run(monkeypatch, feeds=[self.ETTIKA_FEED], errors=self.AUTH_ERROR,
+                  uploads=[self.failed_upload("u5", "2026-05-22T10:00:00+0000"),
+                           self.failed_upload("u4", "2026-05-22T09:00:00+0000")])
+        failed = next(i for i in out["issues"] if i["check"] == "upload_failed")
+        assert failed["severity"] == "HIGH"
+        assert failed["reason"] == "HTTP Authentication Failed"
+        assert "HTTP Authentication Failed" in failed["message"]
+        assert "no_items_persisted" not in checks(out)
+        assert out["health"] == "partial"
+
+    def test_abandoned_unscheduled_feed_is_noted(self, monkeypatch):
+        out = run(monkeypatch, feeds=[self.ETTIKA_FEED], errors=self.AUTH_ERROR,
+                  uploads=[self.failed_upload("u5", "2026-05-22T10:00:00+0000")])
+        inactive = next(i for i in out["issues"] if i["check"] == "feed_inactive")
+        assert inactive["severity"] == "LOW"
+        assert "139 days" in inactive["message"]  # 2026-05-22 -> 2026-10-08
+
+    def test_supplementary_only_catalog_gets_integration_note(self, monkeypatch):
+        out = run(monkeypatch, feeds=[self.ETTIKA_FEED],
+                  uploads=[upload("u1", "2026-10-07T06:00:00+0000")])
+        note = next(i for i in out["issues"] if i["check"] == "no_primary_feed")
+        assert note["severity"] == "INFO"
+        assert "Shopify" in note["message"]
+
+    def test_primary_feed_present_means_no_integration_note(self, monkeypatch):
+        primary = dict(DAILY_FEED, ingestion_source_type="PRIMARY_FEED")
+        out = run(monkeypatch, feeds=[primary, self.ETTIKA_FEED],
+                  uploads=[upload("u1", "2026-10-08T06:00:00+0000")])
+        assert "no_primary_feed" not in checks(out)
+
+    def test_failure_only_visible_in_error_sample_is_still_raised(self, monkeypatch):
+        # error_count came back 0, but the sample has a fatal and no item was ever read
+        out = run(monkeypatch, feeds=[self.ETTIKA_FEED], errors=self.AUTH_ERROR,
+                  uploads=[self.failed_upload("u1", "2026-10-07T06:00:00+0000", errors=0)])
+        failed = next(i for i in out["issues"] if i["check"] == "upload_failed")
+        assert failed["reason"] == "HTTP Authentication Failed"
+        assert len([i for i in out["issues"] if i["check"] == "upload_failed"]) == 1
+
+    def test_failed_upload_without_error_sampling_still_flagged_by_counts(self, monkeypatch):
+        out = run(monkeypatch, feeds=[self.ETTIKA_FEED], include_errors=False,
+                  uploads=[self.failed_upload("u1", "2026-10-07T06:00:00+0000")])
+        failed = next(i for i in out["issues"] if i["check"] == "upload_failed")
+        assert "reason" not in failed
+
+    def test_inactivity_threshold_is_30_days(self, monkeypatch):
+        manual = {"id": "f1", "name": "Manual", "product_count": 10}
+        for start, expected in (("2026-09-09T12:00:00+0000", False),   # 29 days
+                                ("2026-09-07T12:00:00+0000", True)):    # 31 days
+            out = run(monkeypatch, feeds=[manual], uploads=[upload("u1", start)])
+            assert ("feed_inactive" in checks(out)) is expected, start
+
+    def test_scheduled_feed_uses_staleness_not_inactivity(self, monkeypatch):
+        out = run(monkeypatch, uploads=[upload("u1", "2026-08-01T12:00:00+0000")])
+        assert "feed_stale" in checks(out)
+        assert "feed_inactive" not in checks(out)
+
+
 def test_registered_as_read_only_tool():
     from meta_ads_mcp.server import mcp
     tools = {t.name: t for t in mcp._tool_manager.list_tools()}

@@ -17,7 +17,7 @@ from typing import Any, Optional
 from meta_ads_mcp.server import mcp
 from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
-from meta_ads_mcp.core.utils import ensure_account_id_format
+from meta_ads_mcp.core.utils import ensure_account_id_format, truncation_fields
 
 logger = logging.getLogger("meta-ads-mcp.catalogs")
 
@@ -573,6 +573,7 @@ INVALID_RATIO_CRITICAL = 0.20   # >=20% of detected items invalid in the latest 
 INVALID_RATIO_HIGH = 0.05       # >=5%
 ITEM_DROP_HIGH_PCT = 20.0       # persisted items fell this much vs the previous upload
 MAX_UPLOADS = 10
+UNSCHEDULED_FEED_INACTIVE_DAYS = 30  # no schedule => no expected cadence; this much silence is still worth a note
 MAX_ERROR_SAMPLES = 3           # sample rows/products kept per error
 
 SCHEDULE_INTERVAL_HOURS = {"HOURLY": 1, "DAILY": 24, "WEEKLY": 168, "MONTHLY": 720}
@@ -649,14 +650,24 @@ def _normalize_upload(raw: dict) -> dict:
     }
 
 
+UPLOAD_FAILED_FIX = (
+    "See the sampled errors for the cause. Typical ones: an expired feed credential, a changed or "
+    "unreachable feed URL, or the host blocking Meta's fetcher."
+)
+
+
+def _feed_issue(feed: dict, severity: str, check: str, message: str, fix: str) -> dict:
+    label = feed.get("name") or feed.get("id")
+    return {"severity": severity, "check": check, "feed_id": feed.get("id"),
+            "message": f"{label}: {message}", "fix": fix}
+
+
 def _assess_feed(feed: dict, uploads: list[dict], now: datetime) -> list[dict]:
     """Severity-ranked issues for one feed from its schedule and recent uploads (newest first)."""
     issues: list[dict] = []
-    label = feed.get("name") or feed.get("id")
 
     def add(severity: str, check: str, message: str, fix: str) -> None:
-        issues.append({"severity": severity, "check": check, "feed_id": feed.get("id"),
-                       "message": f"{label}: {message}", "fix": fix})
+        issues.append(_feed_issue(feed, severity, check, message, fix))
 
     if not uploads:
         add(SEVERITY_HIGH, "feed_never_uploaded", "no upload sessions found",
@@ -676,6 +687,18 @@ def _assess_feed(feed: dict, uploads: list[dict], now: datetime) -> list[dict]:
             add(SEVERITY_HIGH, "feed_stale",
                 f"last upload {age_h:.0f}h ago, schedule expects one every {interval:.0f}h",
                 "Confirm the feed URL is reachable and returns the file; check fetch errors in Commerce Manager.")
+
+    elif reference and not interval:
+        age_d = (now - reference).total_seconds() / 86400
+        if age_d >= UNSCHEDULED_FEED_INACTIVE_DAYS:
+            add(SEVERITY_LOW, "feed_inactive",
+                f"no upload for {age_d:.0f} days and no schedule is configured",
+                "If this feed should be refreshing, add a schedule; if it was replaced, remove it from Commerce Manager.")
+
+    if latest["completed"] and not latest["items_detected"] and (latest["error_count"] or 0) > 0:
+        add(SEVERITY_HIGH, "upload_failed",
+            f"latest upload failed before reading any items ({latest['error_count']} error(s))",
+            UPLOAD_FAILED_FIX)
 
     if not latest["completed"] and started and (now - started).total_seconds() > 2 * 3600:
         add(SEVERITY_MEDIUM, "upload_not_finished",
@@ -825,6 +848,20 @@ def get_catalog_feed_health(
                 total = (res.get("summary") or {}).get("total_count")
                 if total is not None:
                     report["latest_upload_error_total"] = total
+
+                # An upload that never read an item (bad credentials, dead URL) is explained by its
+                # fatal error; attach it, and raise the issue if the counts alone did not.
+                fatal = next((e for e in sampled if e["severity"] == "fatal"), None)
+                latest = uploads[0]
+                if fatal and latest["completed"] and not latest["items_detected"]:
+                    failed = next((i for i in report.get("issues", []) if i["check"] == "upload_failed"), None)
+                    if failed is None:
+                        failed = _feed_issue(feed, SEVERITY_HIGH, "upload_failed",
+                                             "latest upload failed before reading any items", UPLOAD_FAILED_FIX)
+                        report.setdefault("issues", []).append(failed)
+                        issues.append(failed)
+                    failed["reason"] = fatal["summary"]
+                    failed["message"] += f": {fatal['summary']}"
             except MetaAPIError as e:
                 errors[f"errors:{fid}"] = str(e)
         feed_reports.append(report)
@@ -835,6 +872,15 @@ def get_catalog_feed_health(
             "severity": SEVERITY_INFO, "check": "feed_exists", "feed_id": None,
             "message": "No product feed on this catalog. It may be managed manually, via Shops, or a partner integration.",
             "fix": "Nothing to check here; use get_catalog_products for item-level status.",
+        })
+
+    if feeds and all(f.get("ingestion_source_type") == "SUPPLEMENTARY_FEED" for f in feeds):
+        issues.append({
+            "severity": SEVERITY_INFO, "check": "no_primary_feed", "feed_id": None,
+            "message": "Only supplementary feeds exist on this catalog. Its main product data probably comes "
+                       "from a partner integration (e.g. Shopify) or manual management, which does not appear "
+                       "as a feed, so feed checks cannot tell whether that data is fresh.",
+            "fix": "Use the catalog diagnostics below and get_catalog_products for item-level status.",
         })
 
     # --- Catalog diagnostics ---
@@ -888,5 +934,130 @@ def get_catalog_feed_health(
         )
         if response["health"] == "healthy":
             response["health"] = "unknown"  # nothing was flagged, but part of the data could not be read
+    response["rate_limit_usage_pct"] = api_client.rate_limits.max_usage_pct
+    return response
+
+
+# --- Listing catalogs (so a catalog ID can be found without already knowing it) ---
+
+CATALOG_LIST_FIELDS = ["id", "name", "product_count", "feed_count", "vertical", "business{id,name}"]
+CATALOG_LIST_FIELDS_BASIC = ["id", "name", "product_count", "vertical"]
+MAX_BUSINESSES = 20
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def list_catalogs(
+    business_id: Optional[str] = None,
+    account_id: Optional[str] = None,
+    include_shared: bool = True,
+    limit: int = 50,
+) -> dict:
+    """
+    List product catalogs, so a catalog ID can be found without already knowing it.
+
+    Returns catalogs a business owns plus (by default) catalogs other businesses have
+    shared with it. Which business to look in:
+    - business_id: that business.
+    - account_id: the business that owns that ad account. The catalog an account advertises
+      from can belong to a different business (e.g. the client's); if it is missing here,
+      look under that business or use the account's campaigns' promoted_object.
+    - neither: every business the token belongs to (up to 20).
+
+    Read-only. Needs business_management and catalog_management and access to the business.
+
+    Args:
+        business_id: Business ID to list catalogs for.
+        account_id: Ad account ID; its owning business is used.
+        include_shared: Also include catalogs shared with the business (default True).
+        limit: Max catalogs per business and relation, 1-100 (default 50).
+    """
+    api_client._ensure_initialized()
+    limit = max(1, min(int(limit), 100))
+    errors: dict[str, str] = {}
+    note_parts: list[str] = []
+
+    # --- Which businesses ---
+    businesses: list[dict] = []
+    try:
+        if business_id:
+            businesses = [{"id": str(business_id).strip()}]
+        elif account_id:
+            account_id = ensure_account_id_format(account_id)
+            acct = api_client.graph_get(f"/{account_id}", fields=["business{id,name}"])
+            owner = acct.get("business")
+            if not isinstance(owner, dict) or not owner.get("id"):
+                return {
+                    "account_id": account_id,
+                    "error": "This ad account has no owning business visible to the token.",
+                    "hint": "Pass business_id instead (Business Settings > Business info shows it).",
+                }
+            businesses = [owner]
+        else:
+            res = api_client.graph_get("/me/businesses", fields=["id", "name"], params={"limit": "100"})
+            found = [b for b in res.get("data", []) if isinstance(b, dict) and b.get("id")]
+            businesses = found[:MAX_BUSINESSES]
+            if len(found) > MAX_BUSINESSES:
+                note_parts.append(f"Token belongs to {len(found)} businesses; only the first {MAX_BUSINESSES} were checked.")
+    except MetaAPIError as e:
+        return {"error": f"Could not determine which business to list: {e}",
+                "hint": "Pass business_id directly, or check the token has business_management."}
+
+    # --- Catalogs per business and relation ---
+    relations = [("owned", "owned_product_catalogs")]
+    if include_shared:
+        relations.append(("shared", "client_product_catalogs"))
+
+    by_id: dict[str, dict] = {}
+    more_exist = False
+    for biz in businesses:
+        bid = biz["id"]
+        for relation, edge in relations:
+            try:
+                res = _graph_with_fallback(
+                    f"/{bid}/{edge}", CATALOG_LIST_FIELDS, CATALOG_LIST_FIELDS_BASIC,
+                    params={"limit": str(limit)},
+                )
+            except MetaAPIError as e:
+                errors[f"{bid}:{relation}"] = str(e)
+                continue
+            if (res.get("paging") or {}).get("next"):
+                more_exist = True
+            for cat in res.get("data", []):
+                if not isinstance(cat, dict) or not cat.get("id"):
+                    continue
+                entry = by_id.setdefault(cat["id"], {
+                    "id": cat["id"],
+                    "name": cat.get("name"),
+                    "product_count": cat.get("product_count"),
+                    "feed_count": cat.get("feed_count"),
+                    "vertical": cat.get("vertical"),
+                    "owner_business": cat.get("business"),
+                    "found_via": [],
+                })
+                entry["found_via"].append({"business_id": bid, "relation": relation})
+
+    catalogs = sorted(by_id.values(), key=lambda c: (c["name"] or "").lower())
+    response: dict[str, Any] = {
+        "total": len(catalogs),
+        "businesses_checked": businesses,
+        **truncation_fields(
+            {"next": "more"} if more_exist else None, len(catalogs),
+            narrow_hint="Pass a single business_id, or raise limit (max 100), to see the rest.",
+        ),
+        "catalogs": catalogs,
+    }
+    if account_id:
+        response["account_id"] = account_id
+    if note_parts:
+        response["note"] = " ".join(note_parts)
+    if not catalogs and not errors:
+        response["note"] = (response.get("note", "") + " No catalogs found for the business(es) checked. "
+                            "A catalog an ad account uses may belong to another business.").strip()
+    if errors:
+        response["errors"] = errors
+        response["hint"] = (
+            "Meta rejected part of this request. Listing catalogs needs business_management and "
+            "catalog_management, and the token's user must have access to the business."
+        )
     response["rate_limit_usage_pct"] = api_client.rate_limits.max_usage_pct
     return response

@@ -136,7 +136,16 @@ Get Meta's Dataset Quality for a pixel/dataset (web events): event match quality
 Needs a user/system user with "Use events dataset" access on the pixel (long-lived system user token recommended; client system user tokens are not supported). EMQ exists only for web events with Conversions API data - pixel-only datasets return nothing.
 Issue thresholds (EMQ < 6, event_id < 90% on browser/server events) are operator heuristics; the event coverage goal comes from Meta's response.
 
-## Phase v1.1 Wave 5 - Catalog & Connections (7 tools)
+## Phase v1.1 Wave 5 - Catalog & Connections (8 tools)
+
+### list_catalogs [production-safe]
+List product catalogs so a catalog ID can be found without already knowing it: catalogs a business owns plus catalogs shared with it, each with product count, feed count, vertical and owning business.
+- `business_id` (str, optional): Business to list for.
+- `account_id` (str, optional): Ad account ID; its owning business is used.
+- `include_shared` (bool, default true): Also include catalogs shared with the business.
+- `limit` (int, default 50, max 100): Max catalogs per business and relation.
+
+With neither ID it checks every business the token belongs to (up to 20). The catalog an ad account advertises from can belong to a different business (e.g. the client's), so an empty or incomplete result for an account's own business is not proof the account has no catalog. Needs `business_management` and `catalog_management`.
 
 ### get_catalog_info [production-safe]
 Get catalog details including product count, connected pixels, product sets, and feeds.
@@ -183,7 +192,7 @@ Check a catalog's feed health: recent upload sessions per feed (accepted vs inva
 - `include_errors` (bool, default true): Include the error/warning sample for each feed's latest upload.
 - `include_diagnostics` (bool, default true): Include Meta's catalog diagnostic groups.
 
-Needs `catalog_management` and access to the catalog. Sections fail independently. Staleness is only checked for scheduled feeds (manual/API-fed catalogs have no expected cadence). Flag thresholds (invalid items >= 5% / 20%, item drop >= 20%, 2x missed schedule) are operator heuristics; error and diagnostic text comes from Meta. Generating Meta's full downloadable error report is a POST and is not exposed.
+Needs `catalog_management` and access to the catalog. Sections fail independently. Beyond schedule staleness it flags an upload that failed before reading any item (`upload_failed`, with Meta's fatal error text as the reason, e.g. an expired feed credential), an unscheduled feed with no upload for 30+ days (`feed_inactive`), and a catalog with only supplementary feeds (`no_primary_feed`, info): its main product data probably comes from an integration such as Shopify, which does not appear as a feed, so these checks cannot tell whether that data is fresh. Staleness is only checked for scheduled feeds (manual/API-fed catalogs have no expected cadence). Flag thresholds (invalid items >= 5% / 20%, item drop >= 20%, 2x missed schedule) are operator heuristics; error and diagnostic text comes from Meta. Generating Meta's full downloadable error report is a POST and is not exposed.
 
 ## Phase v1.1 Wave 5b - Opportunity Score (1 tool)
 
