@@ -482,6 +482,130 @@ class TestLiveFindings:
         assert by_type["OTHER"]["title"] == "Keep {placeholder}"  # balanced braces untouched
 
 
+class TestUploadInFlight:
+    """Seen live: hourly feeds are mid-upload for ~10 minutes of every hour. The running upload reads
+    0 items, which used to hide the previous upload's real problems (JMC lost its CRITICAL
+    invalid-items flag, Seed lost its warning) so `health` flipped depending on when you called."""
+
+    RUNNING = dict(end=None, detected=0, persisted=0)
+
+    def running(self, uid="u_run", start="2026-10-08T11:30:00+0000"):
+        return upload(uid, start, **self.RUNNING)
+
+    def test_problems_in_the_last_completed_upload_survive_a_running_one(self, monkeypatch):
+        out = run(monkeypatch, uploads=[
+            self.running(),
+            upload("u_done", "2026-10-08T10:20:00+0000", detected=67, persisted=43, invalid=24, errors=24),
+        ])
+        invalid = next(i for i in out["issues"] if i["check"] == "invalid_items")
+        assert invalid["severity"] == "CRITICAL" and "24 of 67" in invalid["message"]
+        assert out["health"] == "degraded"
+        assert out["feeds"][0]["latest_upload_in_progress"] is True
+
+    def test_warning_is_not_lost_while_an_upload_runs(self, monkeypatch):
+        out = run(monkeypatch, uploads=[
+            self.running(),
+            upload("u_done", "2026-10-08T10:55:00+0000", warnings=12),
+        ])
+        assert "upload_warnings" in checks(out)
+
+    def test_error_sample_comes_from_the_completed_upload_not_the_running_one(self, monkeypatch):
+        from meta_ads_mcp.core.catalogs import get_catalog_feed_health
+
+        sampled = []
+
+        def fake(endpoint, params=None, fields=None):
+            if endpoint == "/cat1":
+                return {"id": "cat1", "name": "C", "feed_count": 1}
+            if endpoint.endswith("/product_feeds"):
+                return {"data": [DAILY_FEED]}
+            if endpoint.endswith("/uploads"):
+                return {"data": [self.running(), upload("u_done", "2026-10-08T10:20:00+0000", errors=3)]}
+            if endpoint.endswith("/errors"):
+                sampled.append(endpoint)
+                return {"data": []}
+            return {"data": []}
+
+        monkeypatch.setattr(api_client, "graph_get", fake)
+        out = get_catalog_feed_health("cat1")
+        assert sampled == ["/u_done/errors"]
+        assert out["feeds"][0]["errors_from_upload"] == "u_done"
+
+    def test_failed_upload_is_judged_on_the_completed_one(self, monkeypatch):
+        errors = {"data": [{"id": 1, "summary": "HTTP Authentication Failed", "severity": "fatal"}]}
+        feed = {"id": "f1", "name": "F", "product_count": 0, "schedule": {"interval": "HOURLY"}}
+        out = run(monkeypatch, feeds=[feed], errors=errors, uploads=[
+            self.running(),
+            upload("u_done", "2026-10-08T10:20:00+0000", detected=0, persisted=0, errors=1),
+        ])
+        failed = next(i for i in out["issues"] if i["check"] == "upload_failed")
+        assert failed["reason"] == "HTTP Authentication Failed"
+
+    def test_a_feed_with_only_a_running_upload_gets_no_quality_verdict(self, monkeypatch):
+        out = run(monkeypatch, uploads=[self.running()])
+        assert checks(out) <= {"upload_not_finished"}
+        assert "no_items_persisted" not in checks(out)
+        assert out["health"] in ("healthy", "partial")  # never degraded from an empty in-flight upload
+
+    def test_item_drop_compares_completed_uploads_only(self, monkeypatch):
+        out = run(monkeypatch, uploads=[
+            self.running(),
+            upload("u2", "2026-10-08T10:20:00+0000", detected=600, persisted=600),
+            upload("u1", "2026-10-08T09:20:00+0000", persisted=1000),
+        ])
+        assert "item_count_drop" in checks(out)
+
+    def test_a_running_upload_still_counts_as_recent_activity_for_staleness(self, monkeypatch):
+        feed = {"id": "f1", "name": "F", "product_count": 5, "schedule": {"interval": "HOURLY"}}
+        out = run(monkeypatch, feeds=[feed], uploads=[
+            self.running(start="2026-10-08T11:45:00+0000"),
+            upload("u_done", "2026-10-08T08:00:00+0000"),  # 4h old: stale on its own
+        ])
+        assert "feed_stale" not in checks(out)
+
+    def test_upload_that_has_run_for_hours_is_still_flagged(self, monkeypatch):
+        out = run(monkeypatch, uploads=[self.running(start="2026-10-08T06:00:00+0000"),
+                                        upload("u_done", "2026-10-08T05:00:00+0000")])
+        assert "upload_not_finished" in checks(out)
+
+
+class TestUrlValuedNames:
+    """Seen live: a Shopify-fed feed whose name and file_name were its own URL."""
+
+    FEED = {"id": "f1", "name": "https://user:pw@mustelausa-dev.myshopify.com/", "product_count": 85,
+            "file_name": "https://mustelausa-dev.myshopify.com/feed.csv?token=zzz"}
+
+    def test_feed_health_shows_only_the_host(self, monkeypatch):
+        import json
+        out = run(monkeypatch, feeds=[self.FEED], uploads=[])
+        report = out["feeds"][0]
+        assert report["name"] == "mustelausa-dev.myshopify.com"
+        assert report["file_name"] == "mustelausa-dev.myshopify.com"
+        blob = json.dumps(out)
+        for leaked in ("https://", "user:pw", "feed.csv", "zzz"):
+            assert leaked not in blob, leaked
+        assert "mustelausa-dev.myshopify.com: Meta returned no upload sessions" in out["issues"][0]["message"]
+
+    def test_ordinary_names_are_untouched(self, monkeypatch):
+        feed = {"id": "f1", "name": "Main feed (daily)", "product_count": 5, "file_name": "products.csv"}
+        out = run(monkeypatch, feeds=[feed], uploads=[upload("u1", "2026-10-08T06:00:00+0000")])
+        assert out["feeds"][0]["name"] == "Main feed (daily)"
+        assert out["feeds"][0]["file_name"] == "products.csv"
+
+    def test_get_catalog_info_hides_url_names_too(self, monkeypatch):
+        from meta_ads_mcp.core.catalogs import get_catalog_info
+
+        def fake(endpoint, params=None, fields=None):
+            if endpoint.endswith("/product_feeds"):
+                return {"data": [self.FEED]}
+            return {"id": "cat1", "data": []}
+
+        monkeypatch.setattr(api_client, "graph_get", fake)
+        feeds = get_catalog_info("cat1")["feeds"]
+        assert feeds[0]["name"] == "mustelausa-dev.myshopify.com"
+        assert "https://" not in str(feeds)
+
+
 def test_registered_as_read_only_tool():
     from meta_ads_mcp.server import mcp
     tools = {t.name: t for t in mcp._tool_manager.list_tools()}

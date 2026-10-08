@@ -652,6 +652,9 @@ def _sanitize_schedule(schedule: Any) -> Any:
 def _sanitize_feed_node(feed: dict) -> dict:
     """A raw ProductFeed node with schedules and the embedded latest upload stripped of URLs/credentials."""
     out = dict(feed)
+    for key in ("name", "file_name"):
+        if key in out:
+            out[key] = _safe_label(out[key])
     for key in ("schedule", "update_schedule"):
         if key in out:
             out[key] = _sanitize_schedule(out[key])
@@ -665,6 +668,16 @@ def _sanitize_feed_node(feed: dict) -> dict:
             latest["source_host"] = host
         out["latest_upload"] = latest
     return out
+
+
+_URL_SCHEME = re.compile(r"^\s*[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
+
+
+def _safe_label(value: Any) -> Any:
+    """A feed name or file name is sometimes the feed's own URL; show only its host, never the URL."""
+    if isinstance(value, str) and _URL_SCHEME.match(value):
+        return _url_host(value.strip()) or "(url)"
+    return value
 
 
 def _clean_meta_text(text: Any) -> Any:
@@ -715,7 +728,7 @@ UPLOAD_FAILED_FIX = (
 
 
 def _feed_issue(feed: dict, severity: str, check: str, message: str, fix: str) -> dict:
-    label = feed.get("name") or feed.get("id")
+    label = _safe_label(feed.get("name")) or feed.get("id")
     return {"severity": severity, "check": check, "feed_id": feed.get("id"),
             "message": f"{label}: {message}", "fix": fix}
 
@@ -739,7 +752,10 @@ def _assess_feed(feed: dict, uploads: list[dict], now: datetime) -> list[dict]:
                 "Check the feed URL/schedule in Commerce Manager and trigger a manual upload.")
         return issues
 
-    latest = uploads[0]
+    latest = uploads[0]  # newest session; may still be running
+    # Hourly feeds spend a good part of each hour mid-upload, and a running upload reads 0 items, so
+    # quality is judged on the most recent upload that finished, not the one in flight.
+    done = next((u for u in uploads if u["completed"]), None)
     started = _parse_meta_time(latest["start_time"])
     ended = _parse_meta_time(latest["end_time"])
 
@@ -763,9 +779,9 @@ def _assess_feed(feed: dict, uploads: list[dict], now: datetime) -> list[dict]:
                 f"no upload for {age_d:.0f} days and no schedule is currently set",
                 "If this feed should be refreshing, add a schedule; if it was replaced, remove it from Commerce Manager.")
 
-    if latest["completed"] and not latest["items_detected"] and (latest["error_count"] or 0) > 0:
+    if done and not done["items_detected"] and (done["error_count"] or 0) > 0:
         add(SEVERITY_HIGH, "upload_failed",
-            f"latest upload failed before reading any items ({latest['error_count']} error(s))",
+            f"latest upload failed before reading any items ({done['error_count']} error(s))",
             UPLOAD_FAILED_FIX)
 
     if not latest["completed"] and started and (now - started).total_seconds() > 2 * 3600:
@@ -773,16 +789,19 @@ def _assess_feed(feed: dict, uploads: list[dict], now: datetime) -> list[dict]:
             "latest upload started over 2h ago and has not finished",
             "Very large or slow feed file; check the feed host's response time.")
 
-    detected, persisted = latest["items_detected"], latest["items_persisted"]
-    if latest["completed"] and detected and persisted == 0:
+    if done is None:
+        return issues  # nothing has finished yet; there is no result to judge
+
+    detected, persisted = done["items_detected"], done["items_persisted"]
+    if detected and persisted == 0:
         add(SEVERITY_CRITICAL, "no_items_persisted",
             f"latest upload detected {detected} items but none were accepted",
             "Fix the fatal feed errors below; no products from this upload reached the catalog.")
 
-    ratio = latest["invalid_ratio"]
+    ratio = done["invalid_ratio"]
     if ratio is not None and ratio > 0 and persisted != 0:
         pct = f"{ratio:.0%}"
-        detail = f"{pct} of items in the latest upload are invalid ({latest['items_invalid']} of {detected})"
+        detail = f"{pct} of items in the latest upload are invalid ({done['items_invalid']} of {detected})"
         fix = "Fix the fatal errors listed for this upload; invalid items are not created or updated."
         if ratio >= INVALID_RATIO_CRITICAL:
             add(SEVERITY_CRITICAL, "invalid_items", detail, fix)
@@ -792,15 +811,15 @@ def _assess_feed(feed: dict, uploads: list[dict], now: datetime) -> list[dict]:
             add(SEVERITY_MEDIUM, "invalid_items", detail, fix)
 
     # Catalog shrinkage vs the previous completed upload (replace feeds delete missing items).
-    previous = next((u for u in uploads[1:] if u["completed"] and u["items_persisted"]), None)
-    if latest["completed"] and previous and persisted is not None:
+    previous = next((u for u in uploads[uploads.index(done) + 1:] if u["completed"] and u["items_persisted"]), None)
+    if previous and persisted is not None:
         drop = (previous["items_persisted"] - persisted) / previous["items_persisted"] * 100
         if drop >= ITEM_DROP_HIGH_PCT:
             add(SEVERITY_HIGH, "item_count_drop",
                 f"accepted items fell {drop:.0f}% ({previous['items_persisted']} -> {persisted}) vs the previous upload",
                 "Check whether the feed file was truncated or products were filtered out upstream.")
 
-    warnings = latest["warning_count"]
+    warnings = done["warning_count"]
     if warnings and not issues:
         add(SEVERITY_LOW, "upload_warnings", f"latest upload has {warnings} warning(s)",
             "Warnings omit malformed optional fields; review the sampled errors below.")
@@ -891,8 +910,8 @@ def get_catalog_feed_health(
         fid = feed.get("id")
         report: dict[str, Any] = {
             "id": fid,
-            "name": feed.get("name"),
-            "file_name": feed.get("file_name"),
+            "name": _safe_label(feed.get("name")),
+            "file_name": _safe_label(feed.get("file_name")),
             "ingestion_source_type": feed.get("ingestion_source_type"),
             "schedule": _sanitize_schedule(feed.get("schedule")),
             "update_schedule": _sanitize_schedule(feed.get("update_schedule")),
@@ -919,9 +938,14 @@ def get_catalog_feed_health(
             report["issues"] = feed_issues
             issues.extend(feed_issues)
 
+        done_upload = next((u for u in uploads if u["completed"]), None)
+        if uploads and not uploads[0]["completed"]:
+            report["latest_upload_in_progress"] = True
         if include_errors and uploads:
+            target = done_upload or uploads[0]  # a running upload has no errors yet; sample the last finished one
             try:
-                res = api_client.graph_get(f"/{uploads[0]['id']}/errors", params={"limit": "25"})
+                report["errors_from_upload"] = target["id"]
+                res = api_client.graph_get(f"/{target['id']}/errors", params={"limit": "25"})
                 sampled = [_normalize_error(e) for e in res.get("data", []) if isinstance(e, dict)]
                 sampled.sort(key=lambda e: 0 if e["severity"] == "fatal" else 1)
                 report["latest_upload_errors"] = sampled
@@ -932,8 +956,7 @@ def get_catalog_feed_health(
                 # An upload that never read an item (bad credentials, dead URL) is explained by its
                 # fatal error; attach it, and raise the issue if the counts alone did not.
                 fatal = next((e for e in sampled if e["severity"] == "fatal"), None)
-                latest = uploads[0]
-                if fatal and latest["completed"] and not latest["items_detected"]:
+                if fatal and done_upload and not done_upload["items_detected"]:
                     failed = next((i for i in report.get("issues", []) if i["check"] == "upload_failed"), None)
                     if failed is None:
                         failed = _feed_issue(feed, SEVERITY_HIGH, "upload_failed",

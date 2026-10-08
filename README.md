@@ -13,6 +13,7 @@ KonQuest Meta Ads MCP uses an open-core model:
 - Campaign and ad set duplication
 - Insights and bulk cross-account analytics
 - Opportunity score, recommendations and score history
+- Performance anomaly and trend signals (computed from daily Insights)
 - Pixel and tracking diagnostics, including Meta dataset quality / event match quality (6 tools)
 - Catalog and DPA support (8 tools, including catalog listing, feed health and product set create/update)
 - Full targeting toolkit (6 tools)
@@ -70,7 +71,7 @@ meta_ads_mcp/
 | Ad Sets | 4 | Create, read, update ad sets with targeting |
 | Ads | 4 | Create, read, update ads |
 | Creatives | 3 | Create, read ad creatives |
-| Insights & Analytics | 1 | Performance data with archetype-aware normalization |
+| Insights & Analytics | 2 | Performance data with archetype-aware normalization; anomaly and trend signals |
 | Pixels & Tracking | 6 | Pixel health, event diagnostics, dataset quality (EMQ), test events, CAPI |
 | Catalogs & DPA | 8 | Product catalogs (list + read), feeds, feed health, product sets, validation |
 | Audiences | 1 | Custom audience listing |

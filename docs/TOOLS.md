@@ -1,6 +1,6 @@
 # Meta Ads MCP - Tool Reference
 
-**List tools and the 200-result cap:** list tools (campaigns, ad sets, ads, creatives, custom audiences) auto-paginate up to 200 results. When more exist the response carries `truncated: true` and a `truncation_note`, plus a `next_cursor` when Meta gives one: pass it back as `after` to fetch the next batch. Until then `total` and any status counts cover only the results fetched. The note also names the filters that tool actually has (e.g. `status_filter`).
+**List tools and the 200-result cap:** list tools (campaigns, ad sets, ads, creatives, custom audiences) auto-paginate up to 200 results. When more exist the response carries `truncated: true` and a `truncation_note`, plus a `next_cursor` when Meta gives one: pass it back as `after` to fetch the next batch. `total` and any status counts describe the batch that call returned, not a running total across calls made with `after`. The note also names the filters that tool actually has (e.g. `status_filter`).
 
 ## Phase v1.0 - Foundation (6 tools)
 
@@ -62,7 +62,7 @@ List ads for an account, campaign, or ad set.
 Get full ad details with creative resolution (fetches creative spec inline).
 - `ad_id` (str): Ad ID.
 
-## Phase v1.1 Wave 2 - Insights & Performance (1 tool)
+## Phase v1.1 Wave 2 - Insights & Performance (2 tools)
 
 ### get_insights [production-safe]
 Get performance insights for any Meta Ads object with objective-aware metric normalization.
@@ -77,6 +77,23 @@ Get performance insights for any Meta Ads object with objective-aware metric nor
 **Normalized metrics:** spend, impressions, reach, frequency, clicks, CTR, CPC, CPM, purchases, CPA, leads, CPL, ROAS, revenue, add_to_cart, initiate_checkout, landing_page_views, video_views.
 
 **Archetype-aware:** Ecommerce gets purchases/ROAS/revenue. Lead gen gets leads/CPL. Awareness gets frequency/video_views. Hybrid gets everything.
+
+### get_performance_signals [production-safe]
+Anomalies and trends computed from daily Insights ("anything unusual lately?", "which way are we moving?"). Meta's Graph API has no anomaly or trend endpoint, so this is built here from `time_increment=1` insights; the findings are this server's heuristics, not Meta's signals.
+- `object_id` (str): Ad account ID to scan across campaigns, or a campaign / ad set ID to look inside it.
+- `level` (str, default 'campaign'): What to scan: 'campaign', 'adset', 'ad', or 'self' (alias 'account') to analyze the object itself.
+- `recent_days` (int, default 3, 1-7) and `baseline_days` (int, default 14, 7-60): the recent window and the baseline window before it. Today is always excluded (partial day).
+- `top_n` (int, default 10, max 25): entities to scan, ranked by spend over the whole window.
+- `metrics` (str, optional): comma-separated subset of spend, impressions, ctr, cpm, cpc, frequency, purchases, cpa, roas, revenue, leads, cpl, conversions, cost_per_conversion. Default follows `archetype` and skips metrics with no data.
+- `archetype` (str, default 'hybrid'): 'ecommerce', 'lead_gen' or 'hybrid'.
+- `conversion_action_type` (str, optional): also analyze one specific action type (e.g. a custom conversion) as `conversions` / `cost_per_conversion`.
+- `include_daily` (bool, default false): add the object's daily series to `trend.daily`.
+
+Returns `trend` (last 7 complete days vs the 7 before: change, direction, better/worse), `anomalies` (worsening first, then by spend; each with recent vs baseline value, change %, z-score, severity and a one-line message), `skipped` (entities too new to judge), `low_volume` (entities whose conversion metrics could not be judged), and the thresholds used.
+
+How a move gets flagged: it must be large (25% for rates and costs, 30% for spend and volumes) AND unusual for that entity (z-score of at least 2.5 against its own daily variation), the metric needs enough volume (10+ baseline conversions; 5,000+ baseline impressions for CTR/CPM/CPC/frequency), and the entity needs 7+ days of baseline delivery. Conversion-based metrics must also beat plain count noise (a Poisson check on the expected number of conversions), so small counts are not over-read. HIGH means worse by 40%+ and 4+ sigma. Two explicit findings: a campaign that stopped delivering, and one still spending with no conversions (flagged only when spend reached 5x its baseline CPA, so zero would be a genuine surprise).
+
+Sensitivity is limited by volume, and that is by design: in simulation a 3-day window reliably catches a CPA doubling only at around 20 purchases/day (95%), about 1 in 3 at 6/day and rarely at 2/day, with false "worse" flags on 0-1% of unchanged campaigns. For low-volume campaigns use `recent_days=7` with a longer `baseline_days` (a 7-day window catches a halving at 6/day about 75% of the time).
 
 ## Phase v1.1 Wave 3 - Creative Reads (2 tools)
 
@@ -193,7 +210,7 @@ Check a catalog's feed health: recent upload sessions per feed (accepted vs inva
 - `include_errors` (bool, default true): Include the error/warning sample for each feed's latest upload.
 - `include_diagnostics` (bool, default true): Include Meta's catalog diagnostic groups.
 
-Needs `catalog_management` and access to the catalog. Sections fail independently. A scheduled feed whose last upload is both over 7 days old and over 10x its interval is rated CRITICAL (`feed looks dead`); otherwise stale means more than 2x the interval (a daily feed 27h old is fine, 49h is not). Staleness uses `schedule`, or `update_schedule` for update-only / supplementary feeds. A feed with products but no visible upload sessions is an info note (`upload_sessions_not_visible`), not a failure. The response includes the catalog's name and counts, and an info note when Meta's `feed_count` is higher than the feeds the feeds edge returns. Feed URLs, usernames and passwords are never returned: schedules keep only the cadence and the host the feed is fetched from (`source_host`); `get_catalog_info` redacts feeds the same way. Beyond schedule staleness it flags an upload that failed before reading any item (`upload_failed`, with Meta's fatal error text as the reason, e.g. an expired feed credential), an unscheduled feed with no upload for 30+ days (`feed_inactive`), and a catalog with only supplementary feeds (`no_primary_feed`, info): its main product data probably comes from an integration such as Shopify, which does not appear as a feed, so these checks cannot tell whether that data is fresh. Staleness is only checked for scheduled feeds (manual/API-fed catalogs have no expected cadence). Flag thresholds (invalid items >= 5% / 20%, item drop >= 20%, 2x missed schedule) are operator heuristics; error and diagnostic text comes from Meta. Generating Meta's full downloadable error report is a POST and is not exposed.
+Needs `catalog_management` and access to the catalog. Sections fail independently. A scheduled feed whose last upload is both over 7 days old and over 10x its interval is rated CRITICAL (`feed looks dead`); otherwise stale means more than 2x the interval (a daily feed 27h old is fine, 49h is not). Staleness uses `schedule`, or `update_schedule` for update-only / supplementary feeds. A feed with products but no visible upload sessions is an info note (`upload_sessions_not_visible`), not a failure. The response includes the catalog's name and counts, and an info note when Meta's `feed_count` is higher than the feeds the feeds edge returns. Feed URLs, usernames and passwords are never returned: schedules keep only the cadence and the host the feed is fetched from (`source_host`); `get_catalog_info` redacts feeds the same way. Upload-quality checks (failed, invalid items, item-count drop, warnings) judge the most recent *completed* upload, because an upload still running reads 0 items and would otherwise hide the previous one's problems on hourly feeds; the error sample comes from the same upload (`errors_from_upload`), and `latest_upload_in_progress` is set when a newer one is running. A feed or file name that is itself a URL is shown as its host only. Beyond schedule staleness it flags an upload that failed before reading any item (`upload_failed`, with Meta's fatal error text as the reason, e.g. an expired feed credential), an unscheduled feed with no upload for 30+ days (`feed_inactive`), and a catalog with only supplementary feeds (`no_primary_feed`, info): its main product data probably comes from an integration such as Shopify, which does not appear as a feed, so these checks cannot tell whether that data is fresh. Staleness is only checked for scheduled feeds (manual/API-fed catalogs have no expected cadence). Flag thresholds (invalid items >= 5% / 20%, item drop >= 20%, 2x missed schedule) are operator heuristics; error and diagnostic text comes from Meta. Generating Meta's full downloadable error report is a POST and is not exposed.
 
 ## Phase v1.1 Wave 5b - Opportunity Score (1 tool)
 
