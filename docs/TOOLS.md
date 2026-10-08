@@ -86,7 +86,7 @@ Anomalies and trends computed from daily Insights ("anything unusual lately?", "
 - `top_n` (int, default 10, max 25): entities to scan, ranked by spend over the whole window.
 - `metrics` (str, optional): comma-separated subset of spend, impressions, ctr, cpm, cpc, frequency, purchases, cpa, roas, revenue, leads, cpl, conversions, cost_per_conversion. Default follows `archetype` and skips metrics with no data.
 - `archetype` (str, default 'hybrid'): 'ecommerce', 'lead_gen' or 'hybrid'.
-- `conversion_action_type` (str, optional): also analyze one specific action type (e.g. a custom conversion) as `conversions` / `cost_per_conversion`.
+- `conversion_action_type` (str, optional): also analyze one specific action type (e.g. a custom conversion) as `conversions` / `cost_per_conversion`. If it has no events in the window (misspelled, or the conversion has not fired lately) a note says so; those metrics are not judged. Explicitly requested `metrics` with no data are named in a note too.
 - `include_daily` (bool, default false): add the object's daily series to `trend.daily`.
 - `min_spend_share` (float, default 0.005, 0-0.5): entities spending under this share of the scanned total over the baseline are skipped as too small to matter (0 disables). It does not apply to `level='self'`.
 
@@ -175,6 +175,8 @@ Flags (our heuristics, not Meta's): `volume_drop` (the last complete day is 50%+
 An ad account's custom conversions: name, rule, event type, default value, when each first and last fired, and a status (`active`, `stale` after 30 days without firing, `never_fired`, `unavailable`, `archived`). Each carries `insights_action_type` (`offsite_conversion.custom.<id>`), the exact action type it has in Insights: pass it as `conversion_action_type` to `get_performance_signals` to analyze that conversion's cost and volume.
 - `account_id` (str): Ad account ID.
 - `include_archived` (bool, default false): also list archived conversions.
+
+A rule longer than 1,000 characters is cut and flagged `rule_truncated`.
 
 ## Phase v1.1 Wave 5 - Catalog & Connections (11 tools)
 
@@ -268,14 +270,16 @@ Sections fail independently - a permissions error on recommendations still retur
 ### get_activity_log [production-safe]
 Change history for an ad account: who changed what, and when (budget, status, bid, audience, creative and targeting edits, ad review results, billing events). The same record as the campaign history page in Ads Manager, newest first. Use it to find what changed just before performance moved.
 - `account_id` (str): Ad account ID.
-- `days` (int, default 7, max 90): how far back to look. Meta does not document how long it keeps history, so a long window may return less than asked.
+- `days` (int, default 7, max 90): how far back to look. Windows over 30 days are read in 30-day chunks, because Meta's activity service returns a generic error on large windows. If an older chunk fails, the newer events are still returned with a note saying how far back it could read. Meta does not document how long it keeps history.
 - `category` (str, optional): ACCOUNT, AD, AD_KEYWORDS, AD_SET, AUDIENCE, BID, BUDGET, CAMPAIGN, DATE, STATUS or TARGETING.
 - `user_id` (str, optional): only changes made by this Facebook user.
-- `object_id` (str, optional): only events whose object is this campaign / ad set / ad / audience. Applied here, not by Meta, so the tool reads further pages (up to 1,000 raw events) to find enough matches.
-- `event_type` (str, optional): only event types containing this text (e.g. 'budget', 'run_status', 'review').
+- `object_id` (str, optional): only events for this campaign / ad set / ad. Uses Meta's per-object history (exact) when no `category` or `user_id` is given; otherwise, or if Meta has no per-object history for that ID, the account history is scanned and filtered here, and a note says so.
+- `event_type` (str, optional): only event types containing this text (e.g. 'budget', 'run_status', 'review'). Applied here, so the tool reads further pages (up to 1,000 raw events) to find enough matches.
 - `limit` (int, default 100, max 500).
 
-Each event has `time`, `local_time` (account timezone), `actor`, `via` (the app used), `what`, `object`, and `change` (`from` / `to`) when Meta supplies old and new values; budget amounts are as Meta returns them, normally in the currency's smallest unit. `summary` counts events by type and by person. Cut-off lists say so (`truncated`).
+Each event has `time`, `local_time` (account timezone), `actor`, `via` (the app used), `what`, `object` (with `kind`) and, when Meta supplies old and new values, `change` (`from` / `to` / `currency` / `change_pct`). Budget and billing amounts are converted from the currency's smallest unit to major units (assuming 2 decimals; zero-decimal currencies are not handled). A pause or activation, which Meta records as a burst of Pending-Process / Active events, is shown as one event with `merged_events`. `summary` counts events by type and by person; `window.events_reach_back_to` says how far back the returned events actually go. A list cut off at `limit` is flagged `truncated`, with a note on how to narrow it.
+
+If Meta's service fails the error comes with a plain-language hint: codes 1 and 2 mean the service failed or the window was too large; permission codes point to `ads_read` and the token.
 
 ### get_delivery_errors [production-safe]
 Campaigns, ad sets and ads Meta has flagged as not delivering properly: effective status `WITH_ISSUES`, `DISAPPROVED` or `PENDING_BILLING_INFO`, with the issue details Meta attaches (code, summary, message, type) and, for ads, its review feedback. Scans a whole account in one call; for one object's full detail use the `get_*_details` tools.
@@ -283,8 +287,10 @@ Campaigns, ad sets and ads Meta has flagged as not delivering properly: effectiv
 - `campaign_id` (str, optional): only this campaign, its ad sets and its ads.
 - `levels` (str, default 'campaign,adset,ad').
 - `statuses` (str, optional): effective statuses to treat as a problem.
+- `recent_days` (int, optional, 1-365): only entities updated in the last N days. Meta is asked to filter by update time; if it refuses, the filter is applied here and a note says so. Old accounts often carry hundreds of long-dead flagged entities, so this is the way to see what is wrong now.
+- `max_entities` (int, default 25, max 1000, 0 for none): entities listed per level, most recently updated first. The summary and reasons always cover every flagged entity.
 
-`summary` counts by level and status and lists the most common reasons. Up to 300 entities per level are read; a longer list is flagged `truncated`. A level that errors is reported under `errors` and never counted as clean.
+The answer leads with `scope` (`{"type": "account"|"campaign", "id": ...}`), `total`, `summary` (counts by level and status) and `reasons`: one entry per distinct problem with how many entities have it (counted once per entity), the levels, and three examples. Ad review feedback, which Meta repeats under `global` and every placement, is folded into `review_reasons` (policy, text, placements) and also counts as a `Review: <policy>` reason. `entities_note` says when the list was cut to `max_entities`. Up to 300 entities per level are read; a longer list is flagged `truncated`. A level that errors is reported under `errors` and never counted as clean.
 
 ## Phase v1.1 Wave 6 - Audiences & Targeting (4 tools)
 

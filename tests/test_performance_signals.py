@@ -460,6 +460,35 @@ class TestTool:
         assert found["cost_per_conversion"]["assessment"] == "worse"
         assert found["conversions"]["change_pct"] == pytest.approx(-75.0, abs=0.5)
 
+    def test_a_conversion_action_type_with_no_events_says_so_instead_of_vanishing(self, monkeypatch):
+        install(monkeypatch, stable_days(BASELINE + RECENT, conversions=0.0))
+        action = "offsite_conversion.custom.999"
+        for kw in ({}, {"metrics": "conversions,cost_per_conversion"}):
+            out = run(object_id="act_1", level="self", conversion_action_type=action, **kw)
+            assert any(action in n and "not judged" in n for n in out.get("notes", [])), kw
+            assert not [a for a in out["anomalies"] if a["metric"] in ("conversions", "cost_per_conversion")]
+        # asked for explicitly it stays listed, but the note explains why nothing was found
+        assert "conversions" in out["metrics_analyzed"]
+        # left to the defaults it is dropped, and the note is the only trace
+        default = run(object_id="act_1", level="self", conversion_action_type=action)
+        assert "conversions" not in default["metrics_analyzed"]
+
+    def test_a_conversion_action_type_with_events_has_no_such_note(self, monkeypatch):
+        install(monkeypatch, stable_days(BASELINE + RECENT, conversions=5.0))
+        out = run(object_id="act_1", level="self", conversion_action_type="offsite_conversion.custom.123")
+        assert not any("No 'offsite_conversion" in n for n in out.get("notes", []))
+
+    def test_explicit_metrics_without_data_are_named_in_a_note(self, monkeypatch):
+        install(monkeypatch, stable_days(BASELINE + RECENT, leads=0.0))
+        out = run(object_id="act_1", level="self", metrics="leads,cpl,spend")
+        note = next(n for n in out["notes"] if n.startswith("No data in the window for"))
+        assert "leads" in note and "cpl" in note and "spend" not in note
+
+    def test_default_metrics_without_data_stay_quiet(self, monkeypatch):
+        install(monkeypatch, stable_days(BASELINE + RECENT, leads=0.0))
+        out = run(object_id="act_1", level="self")
+        assert not any(n.startswith("No data in the window") for n in out.get("notes", []))
+
     def test_paged_entity_rows_are_followed(self, monkeypatch):
         pages = {}
         entities = self.entities()[:2]

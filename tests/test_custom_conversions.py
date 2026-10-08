@@ -90,9 +90,15 @@ class TestContent:
         assert c["custom_event_type"] == "PURCHASE" and c["default_value"] == 25 and c["event_source_type"] == "PIXEL"
         assert c["rule"] == '{"url":{"i_contains":"thank-you"}}'
 
-    def test_a_very_long_rule_is_trimmed(self, monkeypatch):
-        install(monkeypatch, [{"data": [cc("1", "Long", rule="x" * 900)]}])
-        assert len(run()["conversions"][0]["rule"]) == 400
+    def test_a_long_rule_is_trimmed_and_marked_so(self, monkeypatch):
+        install(monkeypatch, [{"data": [cc("1", "Long", rule="x" * 1500)]}])
+        c = run()["conversions"][0]
+        assert len(c["rule"]) == 1000 and c["rule_truncated"] is True
+
+    def test_a_rule_that_fits_is_returned_whole_without_the_marker(self, monkeypatch):
+        install(monkeypatch, [{"data": [cc("1", "Edge", rule="x" * 1000)]}])
+        c = run()["conversions"][0]
+        assert len(c["rule"]) == 1000 and "rule_truncated" not in c
 
     def test_request_shape(self, monkeypatch):
         calls = install(monkeypatch, [{"data": []}])
