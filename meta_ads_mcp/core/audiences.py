@@ -154,6 +154,7 @@ def _classify_audience_health(audience: dict) -> dict:
 def list_custom_audiences(
     account_id: str,
     limit: int = 50,
+    after: Optional[str] = None,
 ) -> dict:
     """
     List custom audiences for an ad account with type classification,
@@ -164,6 +165,8 @@ def list_custom_audiences(
     Args:
         account_id: Ad account ID (e.g., 'act_123456789').
         limit: Max audiences to return (default 50).
+        after: Continue from a previous response's next_cursor. Lists stop at 200 results;
+            when truncated is true, pass next_cursor here to get the next batch.
     """
     api_client._ensure_initialized()
     account_id = ensure_account_id_format(account_id)
@@ -178,7 +181,7 @@ def list_custom_audiences(
                 "time_created", "time_updated",
                 "data_source", "lookalike_spec",
             ],
-            params={"limit": str(min(limit, 100))},
+            params={"limit": str(min(limit, 100)), **({"after": after} if after else {})},
         )
 
         audiences = result.get("data", [])
@@ -187,8 +190,8 @@ def list_custom_audiences(
         all_audiences = list(audiences)
         paging = result.get("paging", {})
         while paging.get("next") and len(all_audiences) < 200:
-            after = paging.get("cursors", {}).get("after")
-            if not after:
+            page_after = paging.get("cursors", {}).get("after")
+            if not page_after:
                 break
             result = api_client.graph_get(
                 f"/{account_id}/customaudiences",
@@ -199,7 +202,7 @@ def list_custom_audiences(
                     "time_created", "time_updated",
                     "data_source", "lookalike_spec",
                 ],
-                params={"limit": str(min(limit, 100)), "after": after},
+                params={"limit": str(min(limit, 100)), "after": page_after},
             )
             next_batch = result.get("data", [])
             if not next_batch:

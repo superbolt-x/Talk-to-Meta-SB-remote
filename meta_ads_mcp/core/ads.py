@@ -231,6 +231,7 @@ def get_ads(
     adset_id: Optional[str] = None,
     status_filter: Optional[str] = None,
     limit: int = 50,
+    after: Optional[str] = None,
 ) -> dict:
     """
     List ads for an account, campaign, or ad set.
@@ -241,11 +242,15 @@ def get_ads(
         adset_id: Optional - filter ads by ad set (takes precedence over campaign_id).
         status_filter: Filter by effective_status: 'ACTIVE', 'PAUSED', 'ARCHIVED', or 'ALL'.
         limit: Maximum results per page (default 50).
+        after: Continue from a previous response's next_cursor. Lists stop at 200 results;
+            when truncated is true, pass next_cursor here to get the next batch.
     """
     api_client._ensure_initialized()
     account_id = ensure_account_id_format(account_id)
 
     params = {"limit": str(min(limit, 100))}
+    if after:
+        params["after"] = after
 
     if status_filter and status_filter.upper() != "ALL":
         status_val = status_filter.upper()
@@ -286,7 +291,7 @@ def get_ads(
         return {
             "total": len(all_ads),
             "status_counts": status_counts,
-            **truncation_fields(paging, len(all_ads)),
+            **truncation_fields(paging, len(all_ads), "Or narrow with adset_id, campaign_id or status_filter."),
             "ads": all_ads,
             "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
         }

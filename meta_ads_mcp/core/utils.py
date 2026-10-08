@@ -66,17 +66,22 @@ def truncation_fields(paging: Optional[dict], fetched: int, narrow_hint: Optiona
     """Report whether a paginated list stopped before Meta ran out of results.
 
     List tools stop at a fixed cap; without this, `total` and any status counts
-    look complete when they only cover the results fetched.
+    look complete when they only cover the results fetched. When Meta gave a
+    cursor it is returned as `next_cursor`, to be passed back as `after`.
     """
-    if not (paging or {}).get("next"):
+    paging = paging or {}
+    if not paging.get("next"):
         return {"truncated": False}
-    return {
-        "truncated": True,
-        "truncation_note": (
-            f"Stopped after {fetched} results but more exist, so total and any counts cover only "
-            "these. " + (narrow_hint or "Narrow the query (e.g. status_filter or a parent campaign/ad set ID) to see the rest.")
-        ),
-    }
+    cursor = (paging.get("cursors") or {}).get("after")
+    note = f"Stopped after {fetched} results but more exist, so total and any counts cover only these."
+    if cursor:
+        note += " Pass next_cursor as `after` to fetch the next page."
+    if narrow_hint:
+        note += f" {narrow_hint}"
+    out: dict = {"truncated": True, "truncation_note": note}
+    if cursor:
+        out["next_cursor"] = cursor
+    return out
 
 
 def currency_to_cents(amount: float) -> str:

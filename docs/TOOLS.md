@@ -1,6 +1,6 @@
 # Meta Ads MCP - Tool Reference
 
-**List tools and the 200-result cap:** list tools (campaigns, ad sets, ads, creatives, custom audiences) auto-paginate up to 200 results. When more exist the response carries `truncated: true` and a `truncation_note`; `total` and any status counts then cover only the results fetched, so narrow the query (e.g. `status_filter`, or a parent campaign/ad set ID) to see the rest.
+**List tools and the 200-result cap:** list tools (campaigns, ad sets, ads, creatives, custom audiences) auto-paginate up to 200 results. When more exist the response carries `truncated: true` and a `truncation_note`, plus a `next_cursor` when Meta gives one: pass it back as `after` to fetch the next batch. Until then `total` and any status counts cover only the results fetched. The note also names the filters that tool actually has (e.g. `status_filter`).
 
 ## Phase v1.0 - Foundation (6 tools)
 
@@ -33,6 +33,7 @@ List campaigns for an ad account with status, budget, and objective info.
 - `account_id` (str): Ad account ID.
 - `status_filter` (str, optional): 'ACTIVE', 'PAUSED', 'ARCHIVED', or 'ALL'.
 - `limit` (int, default 50): Max results per page. Auto-paginates up to 200.
+- `after` (str, optional): Continue from a previous response's `next_cursor`.
 
 ### get_campaign_details [production-safe]
 Get full campaign details including bid strategy, special categories, and ad set count.

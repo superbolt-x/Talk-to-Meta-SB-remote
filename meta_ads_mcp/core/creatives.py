@@ -213,6 +213,7 @@ def get_ad_creatives(
     account_id: str,
     ad_id: Optional[str] = None,
     limit: int = 50,
+    after: Optional[str] = None,
 ) -> dict:
     """
     List ad creatives for an account or specific ad, with image hash resolution.
@@ -221,6 +222,8 @@ def get_ad_creatives(
         account_id: Ad account ID (e.g., 'act_123456789'). Used for image hash resolution.
         ad_id: Optional ad ID. If provided, returns the creative for that specific ad.
         limit: Max results when listing account creatives (default 50).
+        after: Continue from a previous response's next_cursor. Lists stop at 200 results;
+            when truncated is true, pass next_cursor here to get the next batch.
     """
     api_client._ensure_initialized()
 
@@ -259,7 +262,7 @@ def get_ad_creatives(
         result = api_client.graph_get(
             f"/{account_id}/adcreatives",
             fields=CREATIVE_LIST_FIELDS,
-            params={"limit": str(min(limit, 100))},
+            params={"limit": str(min(limit, 100)), **({"after": after} if after else {})},
         )
 
         creatives = result.get("data", [])
@@ -268,13 +271,13 @@ def get_ad_creatives(
         all_creatives = list(creatives)
         paging = result.get("paging", {})
         while paging.get("next") and len(all_creatives) < 200:
-            after = paging.get("cursors", {}).get("after")
-            if not after:
+            page_after = paging.get("cursors", {}).get("after")
+            if not page_after:
                 break
             result = api_client.graph_get(
                 f"/{account_id}/adcreatives",
                 fields=CREATIVE_LIST_FIELDS,
-                params={"limit": str(min(limit, 100)), "after": after},
+                params={"limit": str(min(limit, 100)), "after": page_after},
             )
             next_batch = result.get("data", [])
             if not next_batch:
