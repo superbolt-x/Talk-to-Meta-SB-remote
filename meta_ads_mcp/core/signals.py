@@ -17,14 +17,14 @@ import json
 import logging
 import math
 import statistics
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 
 from meta_ads_mcp.server import mcp
 from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.insights import _extract_action_value
-from meta_ads_mcp.core.utils import get_account_currency
+from meta_ads_mcp.core.utils import format_budget_cents_to_currency, get_account_currency
 
 logger = logging.getLogger("meta-ads-mcp.signals")
 
@@ -46,6 +46,8 @@ SPEND_DIP_PCT = 50.0             # spend falling this far is called out as a del
 SIGMA_FLOOR = 0.05               # daily variation is never taken as less than 5% of the level
 NO_CONVERSION_SPEND_MULTIPLE = 5.0  # recent spend this many baseline-CPAs with 0 conversions: expecting ~5, P(0) < 1%
 TREND_FLAT_PCT = 5.0             # week-over-week moves inside +/-5% are "flat"
+MIN_SPEND_SHARE = 0.005          # entities under 0.5% of the scanned spend are too small to matter
+MAX_ACTIVE_CHECK = 100           # ACTIVE entities checked for "spending nothing"
 MAX_PAGES = 4
 
 THRESHOLDS = {
@@ -54,6 +56,7 @@ THRESHOLDS = {
     "min_percent_change": PCT_FLAG_DEFAULT, "min_percent_change_volume_metrics": 30.0,
     "min_z_score": Z_FLAG, "high_severity_z": Z_HIGH, "high_severity_percent": PCT_HIGH,
     "no_conversion_spend_multiple": NO_CONVERSION_SPEND_MULTIPLE,
+    "min_spend_share": MIN_SPEND_SHARE,
 }
 
 # +1: higher is better, -1: lower is better, 0: neutral (a change, not good or bad)
@@ -69,6 +72,13 @@ LABELS = {
     "frequency": "Frequency", "purchases": "Purchases/day", "revenue": "Revenue/day", "roas": "ROAS",
     "cpa": "CPA", "leads": "Leads/day", "cpl": "CPL", "conversions": "Conversions/day",
     "cost_per_conversion": "Cost per conversion",
+}
+UNITS = {
+    "spend": "currency", "impressions": "count", "ctr": "percent", "cpm": "currency per 1,000 impressions",
+    "cpc": "currency per click", "frequency": "impressions per person (impression-weighted)",
+    "purchases": "count", "revenue": "currency", "roas": "revenue per 1 of spend", "cpa": "currency per purchase",
+    "leads": "count", "cpl": "currency per lead", "conversions": "count",
+    "cost_per_conversion": "currency per conversion",
 }
 BASE_METRICS = ["spend", "impressions", "ctr", "cpm", "cpc", "frequency"]
 ARCHETYPE_METRICS = {
@@ -181,6 +191,11 @@ def _round(value: Optional[float]) -> Optional[float]:
     if value is None:
         return None
     return round(value, 4 if abs(value) < 1 else 2)
+
+
+def _unit(metric: str) -> str:
+    """Count-type metrics are compared as daily averages so windows of different length line up."""
+    return f"{UNITS[metric]}, daily average" if metric in COUNT_METRICS else UNITS[metric]
 
 
 # ----------------------------------------------------------------------------- metric selection
@@ -301,6 +316,7 @@ def _check_metric(metric: str, base_days: list[dict], recent_days: list[dict],
     severity = _severity(metric, assessment, pct, z)
     return {
         "metric": metric,
+        "unit": _unit(metric),
         "assessment": assessment,
         "severity": severity,
         "recent": _round(current),
@@ -336,7 +352,8 @@ def analyze_entity(days_by_date: dict, recent_dates: list[str], baseline_dates: 
         if was_running and base["spend"] > 0:
             per_day = base["spend"] / base_len
             return [{
-                "metric": "delivery", "assessment": "worse", "severity": "MEDIUM",
+                "metric": "delivery", "unit": "currency per day, daily average",
+                "assessment": "worse", "severity": "MEDIUM",
                 "recent": 0.0, "baseline": _round(per_day), "change_pct": -100.0, "z_score": None,
                 "message": (f"Stopped delivering: no spend in the last {recent_len}d, was averaging "
                             f"{_format('spend', per_day)}/day. May be paused or out of budget on purpose."),
@@ -355,7 +372,8 @@ def analyze_entity(days_by_date: dict, recent_dates: list[str], baseline_dates: 
             baseline_cost = base["spend"] / base[count]
             if recent["spend"] >= NO_CONVERSION_SPEND_MULTIPLE * baseline_cost:
                 anomalies.append({
-                    "metric": f"{count}_stopped", "assessment": "worse", "severity": "HIGH",
+                    "metric": f"{count}_stopped", "unit": "count, daily average",
+                    "assessment": "worse", "severity": "HIGH",
                     "recent": 0.0, "baseline": _round(base[count] / base_len), "change_pct": -100.0, "z_score": None,
                     "message": (f"No {count} in the last {recent_len}d despite {_format('spend', recent['spend'])} "
                                 f"spent (baseline cost per {count.rstrip('s')}: {_format('cpa', baseline_cost)})"),
@@ -378,8 +396,41 @@ def _sort_anomalies(items: list[dict]) -> list[dict]:
 
 # ----------------------------------------------------------------------------- trend
 
+def _trend_flags(last: dict, prior: dict, metrics: list[str]) -> list[dict]:
+    """Worsening week-over-week moves worth attention, held to the same volume and noise rules as anomalies.
+
+    This is what catches a step change older than the recent window (it shows in weekly figures but is
+    already inside the anomaly baseline), such as a CPA that jumped ten days ago and never came back.
+    """
+    flags = []
+    for metric in metrics:
+        l, p = _value(metric, last), _value(metric, prior)
+        if l is None or p in (None, 0):
+            continue
+        pct = (l - p) / abs(p) * 100
+        if abs(pct) < PCT_FLAG.get(metric, PCT_FLAG_DEFAULT) or _assess(metric, pct) != "worse":
+            continue
+        if not _passes_volume_gates(metric, prior, last):
+            continue
+        z = _poisson_z(metric, prior, last, 7, 7)
+        if z is not None and abs(z) < Z_FLAG:
+            continue
+        high = z is not None and abs(z) >= Z_HIGH and abs(pct) >= PCT_HIGH
+        flags.append({
+            "metric": metric, "unit": _unit(metric), "severity": "HIGH" if high else "MEDIUM",
+            "change_pct": round(pct, 1), "last_7d": _round(l), "prior_7d": _round(p),
+            "message": (f"{LABELS[metric]} {'up' if pct > 0 else 'down'} {abs(pct):.0f}% vs the prior 7 days: "
+                        f"{_format(metric, l)} vs {_format(metric, p)}"),
+        })
+    return sorted(flags, key=lambda f: (SEVERITY_RANK[f["severity"]], -abs(f["change_pct"])))
+
+
 def build_trend(days_by_date: dict, until: date, metrics: list[str]) -> dict:
-    """Last 7 complete days against the 7 before, per metric."""
+    """Last 7 complete days against the 7 before, per metric.
+
+    Count metrics (spend, purchases, ...) give window totals plus per-day averages; ratio metrics
+    (CTR, CPA, ROAS, ...) are computed from the window's own totals.
+    """
     last_dates = _dates(until, 7)
     prior_dates = _dates(until - timedelta(days=7), 7)
     last, prior = _aggregate(_window(days_by_date, last_dates)), _aggregate(_window(days_by_date, prior_dates))
@@ -387,6 +438,7 @@ def build_trend(days_by_date: dict, until: date, metrics: list[str]) -> dict:
         "last_7d": {"from": last_dates[0], "to": last_dates[-1]},
         "prior_7d": {"from": prior_dates[0], "to": prior_dates[-1]},
         "metrics": {},
+        "worsening": [],
     }
     if last["delivered"] == 0 and prior["delivered"] == 0:
         out["note"] = "No delivery in the last 14 days."
@@ -397,7 +449,14 @@ def build_trend(days_by_date: dict, until: date, metrics: list[str]) -> dict:
         l, p = _value(metric, last), _value(metric, prior)
         if l is None and p is None:
             continue
-        entry: dict[str, Any] = {"last_7d": _round(l), "prior_7d": _round(p)}
+        if metric in COUNT_METRICS:
+            entry: dict[str, Any] = {
+                "unit": UNITS[metric],
+                "last_7d": _round(last[metric]), "prior_7d": _round(prior[metric]),
+                "last_7d_per_day": _round(l), "prior_7d_per_day": _round(p),
+            }
+        else:
+            entry = {"unit": UNITS[metric], "last_7d": _round(l), "prior_7d": _round(p)}
         if l is not None and p not in (None, 0):
             pct = (l - p) / abs(p) * 100
             entry["change_pct"] = round(pct, 1)
@@ -405,7 +464,82 @@ def build_trend(days_by_date: dict, until: date, metrics: list[str]) -> dict:
             entry["assessment"] = ("neutral" if DIRECTION[metric] == 0 or entry["direction"] == "flat"
                                    else _assess(metric, pct))
         out["metrics"][metric] = entry
+    out["worsening"] = _trend_flags(last, prior, metrics)
     return out
+
+
+# ----------------------------------------------------------------------------- active entities that deliver nothing
+
+def _parse_time(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("+0000", "+00:00").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _find_silent_active(object_id: str, level: str, time_range: str, total_days: int, recent_days: int,
+                        currency: Optional[str]) -> tuple[list[dict], list[str]]:
+    """ACTIVE campaigns / ad sets / ads that spent nothing in the whole window.
+
+    Insights returns no rows for an entity that is not delivering, so the scan cannot see one (a $3,000/day
+    campaign whose ad sets are all paused simply never appears). Their status has to be asked for separately.
+    """
+    id_field, _ = LEVEL_ID_FIELDS[level]
+    edge = {"campaign": "campaigns", "adset": "adsets", "ad": "ads"}[level]
+    notes: list[str] = []
+    try:
+        res = api_client.graph_get(
+            f"/{object_id}/{edge}",
+            fields=["id", "name", "effective_status", "start_time", "created_time", "daily_budget", "lifetime_budget"],
+            params={"limit": str(MAX_ACTIVE_CHECK),
+                    "filtering": json.dumps([{"field": "effective_status", "operator": "IN", "value": ["ACTIVE"]}])},
+        )
+    except MetaAPIError as e:
+        return [], [f"Could not check for ACTIVE {edge} that are not delivering: {e}"]
+    active = [a for a in res.get("data", []) if isinstance(a, dict) and a.get("id")]
+    if (res.get("paging") or {}).get("next"):
+        notes.append(f"Only the first {MAX_ACTIVE_CHECK} ACTIVE {edge} were checked for delivery.")
+
+    now = datetime.combine(_today(), time(12, 0), tzinfo=timezone.utc)
+    grace = timedelta(days=recent_days + 1)
+    candidates = []
+    for entity in active:
+        start, created = _parse_time(entity.get("start_time")), _parse_time(entity.get("created_time"))
+        if (start and start > now) or (created and now - created < grace):
+            continue  # scheduled for later, or too new to have been expected to spend
+        candidates.append(entity)
+    if not candidates:
+        return [], notes
+
+    try:
+        rows, _ = _insights(
+            f"/{object_id}/insights", ["spend", "impressions", id_field],
+            {"level": level, "time_range": time_range, "limit": "500",
+             "filtering": json.dumps([{"field": f"{level}.id", "operator": "IN", "value": [c["id"] for c in candidates]}])},
+        )
+    except MetaAPIError as e:
+        return [], notes + [f"Could not check which ACTIVE {edge} delivered: {e}"]
+    delivered = {r.get(id_field) for r in rows if _num(r.get("spend")) > 0 or _num(r.get("impressions")) > 0}
+
+    found = []
+    for entity in candidates:
+        if entity["id"] in delivered:
+            continue
+        budget = entity.get("daily_budget") or entity.get("lifetime_budget")
+        kind = "daily budget" if entity.get("daily_budget") else "lifetime budget"
+        detail = f" ({kind} {format_budget_cents_to_currency(budget, currency)})" if budget else ""
+        found.append({
+            "metric": "not_delivering", "unit": "status check", "assessment": "worse", "severity": "MEDIUM",
+            "recent": 0.0, "baseline": 0.0, "change_pct": None, "z_score": None,
+            "message": f"ACTIVE but no spend in the last {total_days} days{detail}. "
+                       "Check whether its ad sets or ads are paused, or it is out of budget or rejected.",
+            "entity": {"level": level, "id": entity["id"], "name": entity.get("name")},
+            "_spend": 0.0,
+        })
+    return found, notes
 
 
 # ----------------------------------------------------------------------------- fetching
@@ -436,17 +570,22 @@ def get_performance_signals(
     archetype: str = "hybrid",
     conversion_action_type: Optional[str] = None,
     include_daily: bool = False,
+    min_spend_share: float = MIN_SPEND_SHARE,
 ) -> dict:
     """
     Performance anomalies and trends from daily Insights. Answers "anything unusual lately?"
     and "which way are we moving?".
 
-    - trend: the object's last 7 complete days against the 7 before, per metric.
+    - trend: the object's last 7 complete days against the 7 before, per metric (count metrics give
+      7-day totals and per-day averages), with `worsening` listing the meaningful declines. This is
+      what shows a step change older than the recent window.
     - anomalies: for the top entities by spend at `level`, the recent window against the
       baseline window before it. A move is flagged only when it is both large and unusual for
       that entity (z-score on its own daily variation), the metric has enough volume, and the
       entity has at least 7 days of baseline delivery. Also flags campaigns that stopped
-      delivering and ones still spending with no conversions. Worsening moves rank first.
+      delivering, ones still spending with no conversions, and ACTIVE entities that spent nothing
+      at all (which Insights cannot show, so their status is checked separately). Worsening moves
+      rank first, and `summary.top_finding` is the worst of the anomalies and the trend's declines.
 
     These are this server's heuristics, not Meta's signals; thresholds are echoed in the
     response. Today is excluded (partial day). Spend, CPA etc. are in the account's currency.
@@ -466,6 +605,8 @@ def get_performance_signals(
         conversion_action_type: Also analyze this specific action type (e.g. a custom conversion's
             'offsite_conversion.custom.123') as `conversions` and `cost_per_conversion`.
         include_daily: Include the object's daily series in `trend.daily`.
+        min_spend_share: Entities spending less than this share of the scanned total over the
+            baseline (default 0.005 = 0.5%) are skipped as too small to matter. 0 disables it.
     """
     api_client._ensure_initialized()
     level = "self" if level == "account" else level
@@ -483,6 +624,8 @@ def get_performance_signals(
             problems.append(f"unknown metrics: {', '.join(unknown)}; choose from {', '.join(DIRECTION)}")
         if any(m in ("conversions", "cost_per_conversion") for m in requested) and not conversion_action_type:
             problems.append("conversions / cost_per_conversion need conversion_action_type")
+    if not 0 <= float(min_spend_share) <= 0.5:
+        problems.append("min_spend_share must be between 0 and 0.5")
     if problems:
         return {"error": "; ".join(problems), "blocked_at": "input_validation"}
 
@@ -572,7 +715,16 @@ def get_performance_signals(
     anomalies: list[dict] = []
     skipped: list[dict] = []
     low_volume: list[dict] = []
+    notes: list[str] = []
+    scope_spend = sum((object_days.get(dt) or {}).get("spend", 0.0) for dt in baseline_dates)
     for entity in entities:
+        if level != "self" and min_spend_share > 0 and scope_spend > 0:
+            share = sum((entity["days"].get(dt) or {}).get("spend", 0.0) for dt in baseline_dates) / scope_spend
+            if share < min_spend_share:
+                skipped.append({"id": entity["id"], "name": entity["name"],
+                                "reason": (f"spend is {share:.2%} of the total scanned over the baseline "
+                                           f"(floor {min_spend_share:.1%})")})
+                continue
         entity_notes: list[str] = []
         found, reason = analyze_entity(entity["days"], recent_dates, baseline_dates, selected, entity_notes)
         if entity_notes:
@@ -584,21 +736,40 @@ def get_performance_signals(
         anomalies.extend(found)
         if reason:
             skipped.append({"id": entity["id"], "name": entity["name"], "reason": reason})
+
+    if level != "self":
+        silent, silent_notes = _find_silent_active(object_id, level, time_range, total_days, recent_days,
+                                                   response.get("currency"))
+        anomalies.extend(silent)
+        notes.extend(silent_notes)
     anomalies = _sort_anomalies(anomalies)
     for item in anomalies:
         item.pop("_spend", None)
 
-    worse = sum(1 for a in anomalies if a["assessment"] == "worse")
+    worse_items = [a for a in anomalies if a["assessment"] == "worse"]
+    trend_worse = response["trend"].get("worsening", [])
+    top, source = None, None
+    best_anomaly = worse_items[0] if worse_items else None
+    best_trend = trend_worse[0] if trend_worse else None
+    if best_anomaly and (not best_trend or SEVERITY_RANK[best_anomaly["severity"]] <= SEVERITY_RANK[best_trend["severity"]]):
+        top, source = best_anomaly["message"], "anomaly"
+    elif best_trend:
+        top, source = best_trend["message"], "trend"
+
     response["metrics_analyzed"] = selected
     response["summary"] = {
         "entities_analyzed": len(entities) - len(skipped),
         "entities_skipped": len(skipped),
-        "anomalies": len(anomalies),
-        "worse": worse,
+        "worse": len(worse_items),
         "better": sum(1 for a in anomalies if a["assessment"] == "better"),
-        "top_finding": anomalies[0]["message"] if anomalies else None,
+        "changed": sum(1 for a in anomalies if a["assessment"] == "changed"),
+        "trend_worse": len(trend_worse),
+        "top_finding": top,
+        "top_finding_source": source,
     }
     response["anomalies"] = anomalies
+    if notes:
+        response["notes"] = notes
     if skipped:
         response["skipped"] = skipped
     if low_volume:
