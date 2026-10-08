@@ -313,15 +313,24 @@ def rows(days_by_date, **ids):
 
 
 def install(monkeypatch, object_days, entities=None, ranking_error=None, object_error=None,
-            entity_daily_error=None, currency="USD"):
-    """entities: list of (id, name, days_by_date). Routes by request shape and records calls."""
+            entity_daily_error=None, currency="USD", active=None, active_error=None):
+    """entities: list of (id, name, days_by_date). active: ACTIVE entities for the status lookup.
+    Routes by request shape and records calls."""
     calls = []
     entities = entities or []
 
     def fake(endpoint, params=None, fields=None):
         p = dict(params or {})
         calls.append({"endpoint": endpoint, "params": p, "fields": fields})
+        if endpoint.rsplit("/", 1)[-1] in ("campaigns", "adsets", "ads"):
+            if active_error:
+                raise active_error
+            return {"data": active or []}
         if endpoint.endswith("/insights"):
+            if "filtering" in p and "time_increment" not in p:  # "did these ACTIVE entities deliver?"
+                wanted = json.loads(p["filtering"])[0]["value"]
+                return {"data": [{"campaign_id": eid, "spend": "10", "impressions": "1000"}
+                                 for eid, _, _ in entities if eid in wanted]}
             if "filtering" in p:
                 if entity_daily_error:
                     raise entity_daily_error
@@ -520,6 +529,209 @@ class TestToolFailuresAndValidation:
         assert out["window"]["recent"] == {"from": d(1), "to": d(0), "days": 2}
         assert out["window"]["baseline"] == {"from": d(11), "to": d(2), "days": 10}
         assert out["thresholds"]["min_z_score"] == signals.Z_FLAG
+
+
+class TestUnits:
+    """Seen live: trend `last_7d` spend 23,537 was the daily mean (164,760 / 7), not the 7-day total."""
+
+    def test_trend_count_metrics_give_totals_and_per_day_averages_with_units(self):
+        days = stable_days(signals._dates(UNTIL, 14))
+        m = build_trend(days, UNTIL, ["spend", "purchases", "ctr", "cpa"])["metrics"]
+        week = sum(days[dt]["spend"] for dt in signals._dates(UNTIL, 7))
+        assert m["spend"]["last_7d"] == pytest.approx(week, abs=0.01)
+        assert m["spend"]["last_7d_per_day"] == pytest.approx(week / 7, abs=0.01)
+        assert m["spend"]["unit"] == "currency"
+        assert m["purchases"]["last_7d"] == pytest.approx(
+            sum(days[dt]["purchases"] for dt in signals._dates(UNTIL, 7)), abs=0.01)
+
+    def test_trend_ratio_metrics_have_a_unit_and_no_per_day_fields(self):
+        days = stable_days(signals._dates(UNTIL, 14))
+        m = build_trend(days, UNTIL, ["ctr", "cpa"])["metrics"]
+        assert m["ctr"]["unit"] == "percent" and "last_7d_per_day" not in m["ctr"]
+        assert m["cpa"]["unit"] == "currency per purchase"
+        assert m["ctr"]["last_7d"] == pytest.approx(2.0, abs=0.01)
+
+    def test_percent_changes_are_unaffected_by_the_totals_change(self):
+        last7, prior7 = signals._dates(UNTIL, 7), signals._dates(UNTIL - timedelta(days=7), 7)
+        days = {**stable_days(prior7), **stable_days(last7, spend=200.0)}
+        spend = build_trend(days, UNTIL, ["spend"])["metrics"]["spend"]
+        assert spend["change_pct"] == pytest.approx(100.0, abs=3.0)  # totals and averages agree on the change
+        assert spend["last_7d"] == pytest.approx(2 * spend["prior_7d"], rel=0.03)
+
+    def test_anomalies_say_that_count_metrics_are_daily_averages(self):
+        found, _ = run_entity(series(recent_kw={"spend": 150.0}), ["spend", "ctr"])
+        assert by_metric(found)["spend"]["unit"] == "currency, daily average"
+        found, _ = run_entity(series(recent_kw={"clicks": 320.0}), ["ctr"])
+        assert by_metric(found)["ctr"]["unit"] == "percent"
+
+
+def step_change_account():
+    """Healthy for 7 days, then a step change ~10 days ago that never came back (Seed on Sep 28)."""
+    dates = signals._dates(UNTIL, 17)
+    healthy = stable_days(dates[:7], **HV)
+    degraded = stable_days(dates[7:], **{**HV, "purchases": 26.0, "revenue": 2600.0})  # CPA +54%
+    return {**healthy, **degraded}
+
+
+class TestTrendWorsening:
+    def test_a_sustained_decline_is_listed_with_severity(self):
+        last7, prior7 = signals._dates(UNTIL, 7), signals._dates(UNTIL - timedelta(days=7), 7)
+        days = {**stable_days(prior7, **HV), **stable_days(last7, **{**HV, "purchases": 26.0, "revenue": 2600.0})}
+        worse = {f["metric"]: f for f in build_trend(days, UNTIL, ["spend", "cpa", "purchases", "roas", "ctr"])["worsening"]}
+        assert worse["cpa"]["severity"] == "HIGH" and worse["cpa"]["change_pct"] == pytest.approx(53.8, abs=1.0)
+        assert worse["purchases"]["severity"] == "MEDIUM"  # -35%: past the bar, short of the 40% HIGH line
+        assert "spend" not in worse and "ctr" not in worse  # unchanged or neutral
+        assert worse["cpa"]["message"].startswith("CPA up 54% vs the prior 7 days")
+
+    def test_improvements_are_not_listed_as_worsening(self):
+        last7, prior7 = signals._dates(UNTIL, 7), signals._dates(UNTIL - timedelta(days=7), 7)
+        days = {**stable_days(prior7, **HV), **stable_days(last7, **{**HV, "purchases": 60.0, "revenue": 6000.0})}
+        assert build_trend(days, UNTIL, ["cpa", "purchases", "roas"])["worsening"] == []
+
+    def test_small_counts_do_not_count_as_a_decline(self):
+        last7, prior7 = signals._dates(UNTIL, 7), signals._dates(UNTIL - timedelta(days=7), 7)
+        low = {"spend": 100.0, "purchases": 2.0, "revenue": 200.0}
+        days = {**stable_days(prior7, **low), **stable_days(last7, **{**low, "purchases": 1.4, "revenue": 140.0})}
+        assert build_trend(days, UNTIL, ["cpa", "purchases"])["worsening"] == []  # 14 -> ~10 purchases: noise
+
+    def test_flags_are_most_severe_first(self):
+        last7, prior7 = signals._dates(UNTIL, 7), signals._dates(UNTIL - timedelta(days=7), 7)
+        days = {**stable_days(prior7, **HV), **stable_days(last7, **{**HV, "purchases": 26.0, "revenue": 2600.0})}
+        sev = [f["severity"] for f in build_trend(days, UNTIL, ["purchases", "cpa", "roas"])["worsening"]]
+        assert sev == sorted(sev, key=signals.SEVERITY_RANK.get)
+
+
+class TestTopFindingAndSummary:
+    """Seen live: Seed read 'healthy' (0 anomalies, top_finding null) while the trend showed CPA +44%."""
+
+    def test_a_step_change_older_than_the_recent_window_surfaces_through_the_trend(self, monkeypatch):
+        install(monkeypatch, step_change_account())
+        out = run(object_id="act_1", level="self", archetype="ecommerce")
+        assert out["summary"]["trend_worse"] >= 1
+        assert out["summary"]["top_finding_source"] == "trend"
+        assert out["summary"]["top_finding"].startswith("CPA up")
+        assert not [a for a in out["anomalies"] if a["metric"] == "cpa"]  # 3d-vs-14d cannot see it
+
+    def test_summary_separates_worse_better_and_changed(self, monkeypatch):
+        mixed = {**stable_days(BASELINE), **stable_days(RECENT, clicks=320.0, spend=150.0)}  # CTR up, spend up
+        install(monkeypatch, mixed)
+        s = run(object_id="act_1", level="self", metrics="ctr,spend")["summary"]
+        assert s["better"] >= 1 and s["changed"] >= 1 and s["worse"] == 0
+        assert "anomalies" not in s  # no longer a total that mixes good news with bad
+        assert s["top_finding"] is None  # nothing worsened: improvements are not the headline
+
+    def test_the_worse_of_anomaly_and_trend_is_the_headline(self, monkeypatch):
+        install(monkeypatch, step_change_account(),
+                [("B", "Broken", series(baseline_kw=HV, recent_kw={**HV, "purchases": 12.0, "revenue": 1200.0}))])
+        s = run(object_id="act_1", archetype="ecommerce")["summary"]
+        assert s["top_finding_source"] == "anomaly"  # HIGH anomaly beats a MEDIUM/HIGH trend tie
+        assert s["worse"] >= 1
+
+    def test_nothing_wrong_means_no_headline(self, monkeypatch):
+        install(monkeypatch, account_series(), [("A", "Stable", stable_days(ALL))])
+        s = run(object_id="act_1")["summary"]
+        assert s["top_finding"] is None and s["top_finding_source"] is None and s["worse"] == 0
+
+
+class TestMaterialityFloor:
+    """Seen live: ad sets at $36-107/day were flagged on a $35.7k/day account (the floor is level-independent)."""
+
+    def scenario(self, monkeypatch, **kw):
+        big_account = stable_days(ALL, spend=100000.0)
+        tiny = series(recent_kw={"spend": 300.0}, baseline_kw={"spend": 100.0})  # spend x3, but ~0.1% of the account
+        install(monkeypatch, big_account, [("T", "Tiny campaign", tiny)])
+        return run(object_id="act_1", **kw)
+
+    def test_an_entity_far_below_the_floor_is_skipped_with_a_reason(self, monkeypatch):
+        out = self.scenario(monkeypatch)
+        assert out["anomalies"] == []
+        assert out["skipped"][0]["id"] == "T"
+        assert "0.10% of the total scanned" in out["skipped"][0]["reason"] and "floor 0.5%" in out["skipped"][0]["reason"]
+
+    def test_the_floor_can_be_lowered_or_disabled(self, monkeypatch):
+        out = self.scenario(monkeypatch, min_spend_share=0)
+        assert any(a["metric"] == "spend" for a in out["anomalies"])
+        out = self.scenario(monkeypatch, min_spend_share=0.0005)  # 0.05%: the entity is above it
+        assert any(a["metric"] == "spend" for a in out["anomalies"])
+
+    def test_a_meaningful_share_is_analyzed_normally(self, monkeypatch):
+        install(monkeypatch, account_series(), [("A", "Big share", series(recent_kw={"spend": 300.0}))])
+        out = run(object_id="act_1")
+        assert any(a["metric"] == "spend" for a in out["anomalies"])
+
+    def test_the_floor_does_not_apply_when_analyzing_the_object_itself(self, monkeypatch):
+        install(monkeypatch, series(recent_kw={"spend": 300.0}))
+        assert any(a["metric"] == "spend" for a in run(object_id="act_1", level="self")["anomalies"])
+
+    def test_floor_is_validated(self):
+        assert run(object_id="act_1", min_spend_share=0.9)["blocked_at"] == "input_validation"
+        assert run(object_id="act_1", min_spend_share=-0.1)["blocked_at"] == "input_validation"
+
+
+class TestActiveButNotDelivering:
+    """Seen live: an ACTIVE $3,000/day campaign whose ad sets were all paused produced nothing at all,
+    because Insights returns no rows for an entity that is not delivering."""
+
+    LONG_AGO = "2026-01-01T00:00:00+0000"
+
+    def active(self):
+        return [
+            {"id": "S1", "name": "Silent campaign", "effective_status": "ACTIVE", "daily_budget": "300000",
+             "created_time": self.LONG_AGO},
+            {"id": "A", "name": "Delivering", "effective_status": "ACTIVE", "created_time": self.LONG_AGO},
+            {"id": "NEW", "name": "Created yesterday", "effective_status": "ACTIVE",
+             "created_time": "2026-10-07T09:00:00+0000"},
+            {"id": "LATER", "name": "Scheduled", "effective_status": "ACTIVE", "created_time": self.LONG_AGO,
+             "start_time": "2026-10-20T00:00:00+0000"},
+        ]
+
+    def test_silent_active_campaign_is_flagged_with_its_budget(self, monkeypatch):
+        install(monkeypatch, account_series(), [("A", "Delivering", stable_days(ALL))], active=self.active())
+        out = run(object_id="act_1")
+        silent = [a for a in out["anomalies"] if a["metric"] == "not_delivering"]
+        assert [a["entity"]["id"] for a in silent] == ["S1"]
+        assert silent[0]["severity"] == "MEDIUM" and silent[0]["assessment"] == "worse"
+        assert "ACTIVE but no spend in the last 17 days (daily budget USD 3000.00)" in silent[0]["message"]
+        assert out["summary"]["worse"] == 1 and out["summary"]["top_finding"] == silent[0]["message"]
+
+    def test_new_and_scheduled_entities_get_the_benefit_of_the_doubt(self, monkeypatch):
+        install(monkeypatch, account_series(), [("A", "Delivering", stable_days(ALL))], active=self.active())
+        ids = {a["entity"]["id"] for a in run(object_id="act_1")["anomalies"] if a["metric"] == "not_delivering"}
+        assert "NEW" not in ids and "LATER" not in ids and "A" not in ids
+
+    def test_asks_only_for_active_entities_and_checks_delivery_for_just_the_candidates(self, monkeypatch):
+        calls = install(monkeypatch, account_series(), [("A", "Delivering", stable_days(ALL))], active=self.active())
+        run(object_id="act_1")
+        status = next(c for c in calls if c["endpoint"] == "/act_1/campaigns")
+        assert json.loads(status["params"]["filtering"]) == [
+            {"field": "effective_status", "operator": "IN", "value": ["ACTIVE"]}]
+        check = [c for c in calls if c["endpoint"].endswith("/insights") and "filtering" in c["params"]
+                 and "time_increment" not in c["params"]]
+        assert len(check) == 1
+        assert json.loads(check[0]["params"]["filtering"])[0]["value"] == ["S1", "A"]  # not NEW / LATER
+
+    def test_ad_set_level_asks_the_adsets_edge(self, monkeypatch):
+        calls = install(monkeypatch, account_series(), [], active=[])
+        run(object_id="act_1", level="adset")
+        assert any(c["endpoint"] == "/act_1/adsets" for c in calls)
+
+    def test_self_level_makes_no_status_calls(self, monkeypatch):
+        calls = install(monkeypatch, account_series(), active=self.active())
+        run(object_id="act_1", level="self")
+        assert not [c for c in calls if c["endpoint"].rsplit("/", 1)[-1] in ("campaigns", "adsets", "ads")]
+
+    def test_status_lookup_failure_is_a_note_not_an_error(self, monkeypatch):
+        install(monkeypatch, account_series(), [("A", "A", stable_days(ALL))],
+                active_error=MetaAPIError("(#100) bad edge", error_code=100))
+        out = run(object_id="act_1")
+        assert "errors" not in out
+        assert "Could not check for ACTIVE campaigns" in out["notes"][0]
+
+    def test_no_active_entities_means_no_second_lookup(self, monkeypatch):
+        calls = install(monkeypatch, account_series(), [("A", "A", stable_days(ALL))], active=[])
+        run(object_id="act_1")
+        assert not [c for c in calls if c["endpoint"].endswith("/insights") and "filtering" in c["params"]
+                    and "time_increment" not in c["params"]]
 
 
 def test_registered_as_read_only_tool():
