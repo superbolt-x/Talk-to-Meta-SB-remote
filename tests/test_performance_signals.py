@@ -758,7 +758,8 @@ class TestNotDeliveringLiveFindings:
         out = run(object_id="act_1")
         silent = self.flagged(out)
         assert [a["entity"]["id"] for a in silent] == ["ST"]
-        assert "ACTIVE but no spend since 2026-09-22 (daily budget USD 3000.00)" in silent[0]["message"]
+        assert ("ACTIVE but no spend in the last 3 days (last spend 2026-09-22; daily budget USD 3000.00)"
+                in silent[0]["message"])
         assert out["summary"]["top_finding"] == silent[0]["message"]
 
     def test_the_old_rule_ignored_an_entity_that_died_before_the_recent_window_but_it_is_news_when_active(self, monkeypatch):
@@ -766,7 +767,7 @@ class TestNotDeliveringLiveFindings:
         install(monkeypatch, account_series(), [entity], active=active)
         out = run(object_id="act_1")
         assert [a["metric"] for a in out["anomalies"]] == ["not_delivering"]  # analyze_entity alone says "not news"
-        assert "since 2026-09-29" in out["anomalies"][0]["message"]
+        assert "last spend 2026-09-29" in out["anomalies"][0]["message"]
 
     def test_the_delivery_check_looks_at_the_recent_window_only(self, monkeypatch):
         entity, active = self.stripes(ALL[:2])
@@ -799,7 +800,8 @@ class TestNotDeliveringLiveFindings:
                    "daily_budget": "0", "lifetime_budget": "11473200"}]
         install(monkeypatch, account_series(), [entity], active=active)
         message = self.flagged(run(object_id="act_1"))[0]["message"]
-        assert "(lifetime budget USD 114732.00)" in message and "0.00)" not in message.replace("114732.00)", "")
+        assert "lifetime budget USD 114732.00)" in message
+        assert "daily budget" not in message and "USD 0.00" not in message
 
     def test_no_budget_at_all_means_no_budget_text(self, monkeypatch):
         entity = ("N", "No budget", stable_days(ALL[:2]))
@@ -807,7 +809,7 @@ class TestNotDeliveringLiveFindings:
                    "daily_budget": "0", "lifetime_budget": "0"}]
         install(monkeypatch, account_series(), [entity], active=active)
         message = self.flagged(run(object_id="act_1"))[0]["message"]
-        assert message.startswith("ACTIVE but no spend since 2026-09-22. ")
+        assert message.startswith("ACTIVE but no spend in the last 3 days (last spend 2026-09-22). ")
         assert "budget" not in message.split(". ")[0]
 
     def test_a_stopped_delivering_finding_is_not_duplicated_and_notes_the_entity_is_still_active(self, monkeypatch):
@@ -819,6 +821,53 @@ class TestNotDeliveringLiveFindings:
         assert [a["metric"] for a in mine] == ["delivery"]
         assert mine[0]["message"].endswith("It is still ACTIVE.")
         assert out["summary"]["worse"] == 1
+
+
+class TestNotDeliveringSeverity:
+    """Seen live on Erie: an ad set under a CBO campaign got no spend because Meta allocated elsewhere.
+    Real, but less urgent than a silent campaign or an ad set with its own budget."""
+
+    LONG_AGO = "2026-01-01T00:00:00+0000"
+
+    def find(self, monkeypatch, level, active):
+        install(monkeypatch, account_series(), [], active=active)
+        out = run(object_id="act_1", level=level)
+        return [a for a in out["anomalies"] if a["metric"] == "not_delivering"], out
+
+    def item(self, eid, **budget):
+        return {"id": eid, "name": f"Item {eid}", "effective_status": "ACTIVE", "created_time": self.LONG_AGO, **budget}
+
+    def test_an_adset_with_no_budget_of_its_own_is_low_and_says_why(self, monkeypatch):
+        found, _ = self.find(monkeypatch, "adset", [self.item("A1")])
+        assert found[0]["severity"] == "LOW"
+        assert "campaign budget (CBO)" in found[0]["message"] and "spending elsewhere" in found[0]["message"]
+
+    def test_zero_budget_fields_also_mean_cbo(self, monkeypatch):
+        found, _ = self.find(monkeypatch, "adset", [self.item("A1", daily_budget="0", lifetime_budget="0")])
+        assert found[0]["severity"] == "LOW"
+
+    def test_an_adset_with_its_own_budget_stays_medium(self, monkeypatch):
+        found, _ = self.find(monkeypatch, "adset", [self.item("A2", daily_budget="5000")])
+        assert found[0]["severity"] == "MEDIUM"
+        assert "CBO" not in found[0]["message"] and "daily budget USD 50.00" in found[0]["message"]
+
+    def test_a_campaign_stays_medium_even_without_a_campaign_level_budget(self, monkeypatch):
+        found, _ = self.find(monkeypatch, "campaign", [self.item("C1")])
+        assert found[0]["severity"] == "MEDIUM" and "CBO" not in found[0]["message"]
+
+    def test_an_ad_stays_medium_with_its_own_advice(self, monkeypatch):
+        found, _ = self.find(monkeypatch, "ad", [self.item("AD1")])
+        assert found[0]["severity"] == "MEDIUM"
+        assert "rejected or is limited" in found[0]["message"] and "CBO" not in found[0]["message"]
+
+    def test_medium_findings_rank_above_low_ones(self, monkeypatch):
+        found, out = self.find(monkeypatch, "adset", [self.item("CBO1"), self.item("OWN1", daily_budget="5000")])
+        assert [a["entity"]["id"] for a in out["anomalies"]] == ["OWN1", "CBO1"]
+        assert out["summary"]["top_finding"] == out["anomalies"][0]["message"]
+
+    def test_a_low_finding_is_still_reported_when_it_is_the_only_one(self, monkeypatch):
+        _, out = self.find(monkeypatch, "adset", [self.item("CBO1")])
+        assert out["summary"]["worse"] == 1 and out["summary"]["top_finding"].startswith("ACTIVE but no spend")
 
 
 def test_registered_as_read_only_tool():
