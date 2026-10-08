@@ -9,6 +9,7 @@ gaps, stale feeds, rejected products, and ecommerce readiness issues.
 
 Phase: v1.1 (Read) / v1.3 (Write)
 """
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -1219,20 +1220,75 @@ MAX_RULE_FEEDS = 10
 MAX_SUGGESTION_ERRORS = 5
 
 
+MAX_PIXEL_CHECKS = 3
+DIAG_SEVERITY = {"MUST_FIX": SEVERITY_HIGH, "WARNING": SEVERITY_MEDIUM, "OPPORTUNITY": SEVERITY_LOW}
+
+
+def _fetch_diagnostic_groups(catalog_id: str, params: dict) -> list[dict]:
+    """Catalog diagnostic groups, with the nested per-event detail when Meta allows it."""
+    try:
+        res = api_client.graph_get(f"/{catalog_id}/diagnostics", fields=DIAGNOSTIC_FIELDS + ["diagnostics"], params=params)
+    except MetaAPIError as e:
+        if e.error_code != 100:
+            raise
+        res = _graph_with_fallback(f"/{catalog_id}/diagnostics", DIAGNOSTIC_FIELDS, DIAGNOSTIC_FIELDS_BASIC, params=params)
+    return [g for g in res.get("data", []) if isinstance(g, dict)]
+
+
+def _normalize_diagnostic_group(g: dict) -> dict:
+    nested = []
+    for d in g.get("diagnostics") or []:
+        if not isinstance(d, dict):
+            continue
+        steps = d.get("instructions")
+        nested.append({
+            "type": d.get("type"),
+            "description": d.get("description"),
+            "details": d.get("details"),
+            "fix": d.get("call_to_action") or (steps[0] if isinstance(steps, list) and steps else None),
+            "fix_url": d.get("action_uri") or d.get("action_url"),
+            "event_source": {"id": d.get("event_source_id"), "type": d.get("event_source_type"),
+                             "event": d.get("event_name")},
+            "affected_items": _int(d.get("number_of_affected_items")),
+        })
+    return {
+        "type": g.get("type"), "severity": g.get("severity"),
+        "title": _clean_meta_text(g.get("title")), "subtitle": _clean_meta_text(g.get("subtitle")),
+        "affected_items": _int(g.get("number_of_affected_items")),
+        "channels": g.get("affected_channels"), "issues": nested,
+    }
+
+
+def _diagnostic_issues(group: dict) -> list[dict]:
+    severity = DIAG_SEVERITY.get(str(group.get("severity")).upper(), SEVERITY_LOW)
+    if not group["issues"]:
+        return [{"severity": severity, "check": group.get("type"), "message": group.get("title") or group.get("type"),
+                 "fix": group.get("subtitle") or "See Commerce Manager > Catalog > Diagnostics.", "fix_url": None}]
+    out = []
+    for n in group["issues"]:
+        src = n["event_source"]
+        where = (f" ({src['event']} on {src['type'] or 'event source'} {src['id']})" if src.get("event") or src.get("id") else "")
+        out.append({"severity": severity, "check": n["type"] or group.get("type"),
+                    "message": f"{n['description'] or n['type']}{where}",
+                    "fix": n["fix"] or n["details"] or group.get("subtitle"), "fix_url": n["fix_url"]})
+    return out
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def get_catalog_readiness(catalog_id: str, connection_method: Optional[str] = None) -> dict:
     """
-    Check whether a catalog is healthy enough to serve dynamic / Advantage+ catalog ads, using Meta's
-    own Dynamic Ads checks (e.g. pixel missing the product events, events missing required parameters,
-    event volume falling, feed upload errors).
+    Whether a catalog is set up to serve dynamic / Advantage+ catalog ads. Reads Meta's catalog
+    diagnostics: event-source issues (no pixel or app connected, no purchase events received in the
+    last 7 days, invalid or missing content IDs, deleted items still seen on the site, apps without
+    Aggregated Event Measurement) and the issues that affect the dynamic ads channel, then adds the
+    connected event sources and, when Meta offers them, the pixel's own Dynamic Ads checks.
 
-    Read-only. Needs the catalog_management permission. A failed check carries Meta's explanation and
-    a link to the Ads Manager page that fixes it. For feed upload errors, use get_catalog_feed_health.
+    Read-only; needs catalog_management and view access to the catalog and its pixel. Feed upload
+    problems are in get_catalog_feed_health. Meta's match-rate history is not available.
 
     Args:
         catalog_id: Product catalog ID.
-        connection_method: Only check events received this way: 'ALL', 'APP', 'BROWSER' or 'SERVER'.
-            Default: Meta's default (all).
+        connection_method: For the pixel checks only: 'ALL', 'APP', 'BROWSER' or 'SERVER'.
     """
     api_client._ensure_initialized()
     catalog_id = str(catalog_id).strip()
@@ -1241,55 +1297,87 @@ def get_catalog_readiness(catalog_id: str, connection_method: Optional[str] = No
         return {"error": f"connection_method must be one of {', '.join(VALID_CONNECTION_METHODS)}",
                 "blocked_at": "input_validation"}
 
+    response: dict[str, Any] = {"catalog_id": catalog_id}
+    errors: dict[str, str] = {}
+    notes: list[str] = []
+    issues: list[dict] = []
+
     try:
-        res = _graph_with_fallback(f"/{catalog_id}/da_checks", READINESS_FIELDS, None,
-                                   params={"connection_method": method} if method else None)
+        node = api_client.graph_get(f"/{catalog_id}", fields=["id", "name", "product_count", "vertical"])
+        response["catalog"] = {k: node.get(k) for k in ("id", "name", "product_count", "vertical")}
+    except MetaAPIError:
+        pass
+
+    # --- Connected event sources ---
+    sources: list[dict] = []
+    sources_known = False
+    try:
+        res = _graph_with_fallback(f"/{catalog_id}/external_event_sources", ["id", "name", "source_type"], ["id", "name"])
+        sources = [{"id": x.get("id"), "name": x.get("name"), "type": x.get("source_type")}
+                   for x in res.get("data", []) if isinstance(x, dict)]
+        sources_known = True
     except MetaAPIError as e:
-        return {"catalog_id": catalog_id, "error": str(e), "error_code": e.error_code,
-                "hint": "Meta's catalog checks need the catalog_management permission and access to this catalog."}
+        errors["event_sources"] = str(e)
+    response["event_sources"] = sources
+    if sources_known and not sources:
+        issues.append({"severity": SEVERITY_HIGH, "check": "no_event_source_connected",
+                       "message": "No pixel or app is connected to this catalog, so catalog ads get no signals from it.",
+                       "fix": "Connect a pixel or app SDK to the catalog in Commerce Manager.", "fix_url": None})
 
-    checks = []
-    for raw in res.get("data", []):
-        if not isinstance(raw, dict):
+    # --- Meta's diagnostics: event-source issues, then issues on the dynamic ads channel ---
+    sections = (
+        ("event_source_issues", {"types": json.dumps(["EVENT_SOURCE_ISSUES"])}),
+        ("dynamic_ads_issues", {"affected_channels": json.dumps(["da"])}),
+    )
+    seen: set = set()
+    for name, params in sections:
+        try:
+            groups = [_normalize_diagnostic_group(g) for g in _fetch_diagnostic_groups(catalog_id, params)]
+        except MetaAPIError as e:
+            errors[name] = str(e)
             continue
-        checks.append({
-            "key": raw.get("key"),
-            "title": raw.get("title"),
-            "result": str(raw.get("result", "")).lower() or None,
-            "description": raw.get("description"),
-            "explanation": raw.get("user_message"),
-            "fix_url": raw.get("action_uri"),
-        })
-    rank = {"failed": 0, "unavailable": 1, "passed": 2}
-    checks.sort(key=lambda c: rank.get(c["result"], 3))
+        fresh = [g for g in groups if (g["type"], g["title"]) not in seen]
+        seen.update((g["type"], g["title"]) for g in groups)
+        response[name] = fresh
+        for g in fresh:
+            issues.extend(_diagnostic_issues(g))
 
-    issues = []
-    for c in checks:
-        if c["result"] == "failed":
-            fix = c["description"] or "Open the fix link for Meta's steps."
-            if c["key"] == "catalog_has_feed_upload_errors":
-                fix = "Run get_catalog_feed_health to see the failing uploads and their errors."
-            issues.append({
-                "severity": SEVERITY_HIGH, "check": c["key"],
-                "message": c["title"] + (f": {c['explanation']}" if c["explanation"] else ""),
-                "fix": fix, "fix_url": c["fix_url"],
-            })
-        elif c["result"] == "unavailable":
-            issues.append({"severity": SEVERITY_INFO, "check": c["key"],
-                           "message": f"{c['title']}: Meta could not run this check right now",
-                           "fix": "Retry later.", "fix_url": None})
+    # --- Pixel-level Dynamic Ads checks (best effort: Meta does not offer the catalog-level edge) ---
+    pixel_checks = []
+    for src in [x for x in sources if str(x.get("type") or "PIXEL").upper() == "PIXEL"][:MAX_PIXEL_CHECKS]:
+        try:
+            res = _graph_with_fallback(f"/{src['id']}/da_checks", READINESS_FIELDS, None,
+                                       params={"connection_method": method} if method else None)
+        except MetaAPIError as e:
+            notes.append(f"Pixel checks for {src.get('name') or src['id']} are not available: {e}")
+            continue
+        checks = [{"key": c.get("key"), "title": c.get("title"), "result": str(c.get("result", "")).lower() or None,
+                   "explanation": c.get("user_message"), "fix_url": c.get("action_uri")}
+                  for c in res.get("data", []) if isinstance(c, dict)]
+        pixel_checks.append({"pixel_id": src["id"], "name": src.get("name"), "checks": checks})
+        for c in checks:
+            if c["result"] == "failed":
+                issues.append({"severity": SEVERITY_HIGH, "check": c["key"],
+                               "message": f"{src.get('name') or src['id']}: {c['title']}"
+                                          + (f": {c['explanation']}" if c["explanation"] else ""),
+                               "fix": "Open the fix link for Meta's steps.", "fix_url": c["fix_url"]})
+    if pixel_checks:
+        response["pixel_checks"] = pixel_checks
 
-    counts = {r: sum(1 for c in checks if c["result"] == r) for r in ("passed", "failed", "unavailable")}
-    status = "not_ready" if counts["failed"] else ("ready" if counts["passed"] else "unknown")
-    response: dict[str, Any] = {
-        "catalog_id": catalog_id, "status": status, "counts": counts,
-        "connection_method": method or "default",
-        "issues": issues, "checks": checks,
-        "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
-    }
-    if not checks:
-        response["note"] = ("Meta returned no checks. The catalog may have no connected pixel or app, "
-                            "or no events to check yet.")
+    order = {SEVERITY_CRITICAL: 0, SEVERITY_HIGH: 1, SEVERITY_MEDIUM: 2, SEVERITY_LOW: 3, SEVERITY_INFO: 4}
+    issues.sort(key=lambda i: order.get(i["severity"], 5))
+    blocking = sum(1 for i in issues if i["severity"] == SEVERITY_HIGH)
+    # "ready" only when every section was read; a section that errored is not reported as clean.
+    response["status"] = "not_ready" if blocking else ("unknown" if errors else "ready")
+    response["summary"] = {"blocking_issues": blocking, "issues": len(issues), "event_sources": len(sources)}
+    response["issues"] = issues
+    if notes:
+        response["notes"] = notes
+    if errors:
+        response["errors"] = errors
+        response["hint"] = ("Meta rejected part of this request. Catalog diagnostics need catalog_management and view "
+                            "access to the catalog and its pixel.")
+    response["rate_limit_usage_pct"] = api_client.rate_limits.max_usage_pct
     return response
 
 
@@ -1320,14 +1408,22 @@ def get_catalog_data_sources(catalog_id: str) -> dict:
     feeds: list[dict] = []
     try:
         raw = _graph_with_fallback(f"/{catalog_id}/product_feeds", FEED_FIELDS_RICH, FEED_FIELDS_BASIC)
-        for feed in (f for f in raw.get("data", []) if isinstance(f, dict)):
+        for feed in [f for f in raw.get("data", []) if isinstance(f, dict)][:MAX_RULE_FEEDS]:
             safe = _sanitize_feed_node(feed)
-            latest = feed.get("latest_upload") if isinstance(feed.get("latest_upload"), dict) else None
             summary = None
-            if latest:
-                u = _normalize_upload(latest)
-                summary = {k: u[k] for k in ("start_time", "end_time", "completed", "input_method",
-                                             "items_detected", "items_persisted", "items_invalid")}
+            try:  # the summary embedded on the feed has no item counts, so read the newest session itself
+                ups = _graph_with_fallback(f"/{feed.get('id')}/uploads", UPLOAD_FIELDS, None, params={"limit": "3"})
+                sessions = sorted((_normalize_upload(u) for u in ups.get("data", []) if isinstance(u, dict)),
+                                  key=lambda u: _parse_meta_time(u["start_time"]) or datetime.min.replace(tzinfo=timezone.utc),
+                                  reverse=True)
+                if sessions:
+                    summary = {k: sessions[0][k] for k in ("start_time", "end_time", "completed", "input_method",
+                                                           "items_detected", "items_persisted", "items_invalid")}
+            except MetaAPIError:
+                pass
+            if summary is None and isinstance(feed.get("latest_upload"), dict):
+                embedded = _normalize_upload(feed["latest_upload"])
+                summary = {k: embedded[k] for k in ("start_time", "end_time", "completed")}
             feeds.append({
                 "id": safe.get("id"), "name": safe.get("name"), "file_name": safe.get("file_name"),
                 "type": safe.get("ingestion_source_type"),
@@ -1430,6 +1526,8 @@ def get_feed_rules(
             errors[f"rules:{fid}"] = str(e)
 
         if include_suggestions:
+            report["suggestions"] = []
+            report["suggestions_from_upload"] = None
             try:
                 ups = _graph_with_fallback(f"/{fid}/uploads", ["id", "start_time", "end_time"], None, params={"limit": "5"})
                 done = next((u for u in ups.get("data", []) if isinstance(u, dict) and u.get("end_time")), None)
@@ -1452,6 +1550,8 @@ def get_feed_rules(
                                                 "severity": str(err.get("severity", "")).lower() or None,
                                                 "suggested_rules": rules})
                     report["suggestions"] = suggestions
+                else:
+                    report["suggestions_note"] = "No finished upload to take errors from."
             except MetaAPIError as e:
                 errors[f"suggestions:{fid}"] = str(e)
         reports.append(report)
