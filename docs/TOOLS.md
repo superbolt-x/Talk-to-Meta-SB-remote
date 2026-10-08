@@ -1,5 +1,7 @@
 # Meta Ads MCP - Tool Reference
 
+**List tools and the 200-result cap:** list tools (campaigns, ad sets, ads, creatives, custom audiences) auto-paginate up to 200 results. When more exist the response carries `truncated: true` and a `truncation_note`; `total` and any status counts then cover only the results fetched, so narrow the query (e.g. `status_filter`, or a parent campaign/ad set ID) to see the rest.
+
 ## Phase v1.0 - Foundation (6 tools)
 
 ### check_token_status [production-safe]
@@ -192,7 +194,7 @@ Get Meta's opportunity score (0-100) for an ad account, Meta's recommendations r
 - `history_days` (int, default 0): Also return daily history for this many days (max 45; Meta lags ~2 days so it ends 2 days ago).
 - `explain_history` (bool, default false): With history, include the per-campaign changes that moved the score.
 
-Sections fail independently - a permissions error on recommendations still returns the score. The score is Meta's guidance, not a performance guarantee.
+Sections fail independently - a permissions error on recommendations still returns the score. The score is Meta's guidance, not a performance guarantee. Many recommendations can carry the same lift (commonly 1 point each on a high score), so ranking among them is Meta's order. The live score can legitimately differ from the history series (history lags ~2 days); when they are 5+ points apart `history_summary.live_vs_history_note` says so.
 
 ## Phase v1.1 Wave 6 - Audiences & Targeting (4 tools)
 

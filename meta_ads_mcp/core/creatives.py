@@ -17,7 +17,7 @@ from typing import Optional
 from meta_ads_mcp.server import mcp
 from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
-from meta_ads_mcp.core.utils import ensure_account_id_format
+from meta_ads_mcp.core.utils import ensure_account_id_format, truncation_fields
 
 logger = logging.getLogger("meta-ads-mcp.creatives")
 
@@ -278,12 +278,14 @@ def get_ad_creatives(
             )
             next_batch = result.get("data", [])
             if not next_batch:
+                paging = {}
                 break
             all_creatives.extend(next_batch)
             paging = result.get("paging", {})
 
         return {
             "total": len(all_creatives),
+            **truncation_fields(paging, len(all_creatives)),
             "creatives": all_creatives,
             "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
         }

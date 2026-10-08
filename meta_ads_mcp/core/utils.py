@@ -62,6 +62,23 @@ def format_budget_cents_to_currency(cents: int | str, currency: Optional[str] = 
     return f"{currency} {value:.2f}" if currency else f"{value:.2f}"
 
 
+def truncation_fields(paging: Optional[dict], fetched: int, narrow_hint: Optional[str] = None) -> dict:
+    """Report whether a paginated list stopped before Meta ran out of results.
+
+    List tools stop at a fixed cap; without this, `total` and any status counts
+    look complete when they only cover the results fetched.
+    """
+    if not (paging or {}).get("next"):
+        return {"truncated": False}
+    return {
+        "truncated": True,
+        "truncation_note": (
+            f"Stopped after {fetched} results but more exist, so total and any counts cover only "
+            "these. " + (narrow_hint or "Narrow the query (e.g. status_filter or a parent campaign/ad set ID) to see the rest.")
+        ),
+    }
+
+
 def currency_to_cents(amount: float) -> str:
     """Convert a currency amount to Meta API cents format (as string)."""
     return str(int(amount * 100))

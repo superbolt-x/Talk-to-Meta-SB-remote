@@ -19,6 +19,7 @@ from meta_ads_mcp.core.utils import (
     ensure_account_id_format,
     format_budget_cents_to_currency,
     get_account_currency,
+    truncation_fields,
 )
 
 logger = logging.getLogger("meta-ads-mcp.campaigns")
@@ -120,6 +121,7 @@ def get_campaigns(
             )
             next_campaigns = result.get("data", [])
             if not next_campaigns:
+                paging = {}
                 break
             for c in next_campaigns:
                 if c.get("daily_budget"):
@@ -140,6 +142,7 @@ def get_campaigns(
             "total": len(all_campaigns),
             "status_counts": status_counts,
             "pages_fetched": page_count,
+            **truncation_fields(paging, len(all_campaigns)),
             "currency": currency,
             "campaigns": all_campaigns,
             "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,

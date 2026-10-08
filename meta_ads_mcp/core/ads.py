@@ -43,7 +43,7 @@ from typing import Any, Optional
 from meta_ads_mcp.server import mcp
 from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
-from meta_ads_mcp.core.utils import ensure_account_id_format
+from meta_ads_mcp.core.utils import ensure_account_id_format, truncation_fields
 
 logger = logging.getLogger("meta-ads-mcp.ads")
 
@@ -273,6 +273,7 @@ def get_ads(
             result = api_client.graph_get(endpoint, fields=AD_LIST_FIELDS, params=params)
             next_ads = result.get("data", [])
             if not next_ads:
+                paging = {}
                 break
             all_ads.extend(next_ads)
             paging = result.get("paging", {})
@@ -285,6 +286,7 @@ def get_ads(
         return {
             "total": len(all_ads),
             "status_counts": status_counts,
+            **truncation_fields(paging, len(all_ads)),
             "ads": all_ads,
             "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
         }

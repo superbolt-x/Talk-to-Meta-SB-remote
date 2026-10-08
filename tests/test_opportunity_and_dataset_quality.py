@@ -107,6 +107,33 @@ class TestGetOpportunityScore:
         assert (summary["start_score"], summary["end_score"], summary["change"]) == (70.0, 76.0, 6.0)
         assert summary["direction"] == "up"
 
+    def _score_vs_history(self, monkeypatch, live, last_history):
+        from meta_ads_mcp.core.opportunity import get_opportunity_score
+
+        def fake_get(endpoint, params=None, fields=None):
+            if endpoint.endswith("/opportunity_score_history"):
+                return {"data": [{"date": "2026-10-05", "opportunity_score": 60},
+                                 {"date": "2026-10-06", "opportunity_score": last_history}]}
+            return {"opportunity_score": live}
+
+        monkeypatch.setattr(api_client, "graph_get", fake_get)
+        return get_opportunity_score("5", include_recommendations=False, history_days=14)
+
+    def test_large_live_vs_history_gap_is_explained(self, monkeypatch):
+        # Seen live: headline score 86 while history ended at 62 two days earlier.
+        note = self._score_vs_history(monkeypatch, 86, 62)["history_summary"]["live_vs_history_note"]
+        assert "24 points above" in note
+        assert "62" in note and "2026-10-06" in note
+        assert "explain_history=true" in note
+
+    def test_gap_below_the_threshold_gets_no_note(self, monkeypatch):
+        summary = self._score_vs_history(monkeypatch, 66, 62)["history_summary"]
+        assert "live_vs_history_note" not in summary
+
+    def test_live_score_below_history_is_described_as_below(self, monkeypatch):
+        note = self._score_vs_history(monkeypatch, 50, 62)["history_summary"]["live_vs_history_note"]
+        assert "12 points below" in note
+
     def test_partial_failure_still_returns_what_worked(self, monkeypatch):
         from meta_ads_mcp.core.opportunity import get_opportunity_score
 
