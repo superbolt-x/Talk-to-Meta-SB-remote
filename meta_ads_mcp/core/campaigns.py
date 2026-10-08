@@ -65,6 +65,7 @@ def get_campaigns(
     account_id: str,
     status_filter: Optional[str] = None,
     limit: int = 50,
+    after: Optional[str] = None,
 ) -> dict:
     """
     List campaigns for an ad account with status and budget info.
@@ -74,11 +75,15 @@ def get_campaigns(
         status_filter: Filter by effective_status: 'ACTIVE', 'PAUSED', 'ARCHIVED', or 'ALL'.
             If not set, returns all campaigns.
         limit: Maximum results per page (default 50, max 100).
+        after: Continue from a previous response's next_cursor. Lists stop at 200 results;
+            when truncated is true, pass next_cursor here to get the next batch.
     """
     api_client._ensure_initialized()
     account_id = ensure_account_id_format(account_id)
 
     params = {"limit": str(min(limit, 100))}
+    if after:
+        params["after"] = after
     currency = get_account_currency(account_id)
 
     if status_filter and status_filter.upper() != "ALL":
@@ -142,7 +147,7 @@ def get_campaigns(
             "total": len(all_campaigns),
             "status_counts": status_counts,
             "pages_fetched": page_count,
-            **truncation_fields(paging, len(all_campaigns)),
+            **truncation_fields(paging, len(all_campaigns), "Or narrow with status_filter (e.g. 'ACTIVE')."),
             "currency": currency,
             "campaigns": all_campaigns,
             "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,

@@ -1,6 +1,6 @@
 # Meta Ads MCP - Tool Reference
 
-**List tools and the 200-result cap:** list tools (campaigns, ad sets, ads, creatives, custom audiences) auto-paginate up to 200 results. When more exist the response carries `truncated: true` and a `truncation_note`; `total` and any status counts then cover only the results fetched, so narrow the query (e.g. `status_filter`, or a parent campaign/ad set ID) to see the rest.
+**List tools and the 200-result cap:** list tools (campaigns, ad sets, ads, creatives, custom audiences) auto-paginate up to 200 results. When more exist the response carries `truncated: true` and a `truncation_note`, plus a `next_cursor` when Meta gives one: pass it back as `after` to fetch the next batch. Until then `total` and any status counts cover only the results fetched. The note also names the filters that tool actually has (e.g. `status_filter`).
 
 ## Phase v1.0 - Foundation (6 tools)
 
@@ -33,6 +33,7 @@ List campaigns for an ad account with status, budget, and objective info.
 - `account_id` (str): Ad account ID.
 - `status_filter` (str, optional): 'ACTIVE', 'PAUSED', 'ARCHIVED', or 'ALL'.
 - `limit` (int, default 50): Max results per page. Auto-paginates up to 200.
+- `after` (str, optional): Continue from a previous response's `next_cursor`.
 
 ### get_campaign_details [production-safe]
 Get full campaign details including bid strategy, special categories, and ad set count.
@@ -143,7 +144,7 @@ List product catalogs so a catalog ID can be found without already knowing it: c
 - `business_id` (str, optional): Business to list for.
 - `account_id` (str, optional): Ad account ID; its owning business is used.
 - `include_shared` (bool, default true): Also include catalogs shared with the business.
-- `limit` (int, default 50, max 100): Max catalogs per business and relation.
+- `limit` (int, default 50, max 500): Max catalogs per business and relation; pages through Meta's results up to this many. If an edge is cut off, `truncated_edges` names it (e.g. `1234:shared`).
 
 With neither ID it checks every business the token belongs to (up to 20). The catalog an ad account advertises from can belong to a different business (e.g. the client's), so an empty or incomplete result for an account's own business is not proof the account has no catalog. Needs `business_management` and `catalog_management`.
 
@@ -192,7 +193,7 @@ Check a catalog's feed health: recent upload sessions per feed (accepted vs inva
 - `include_errors` (bool, default true): Include the error/warning sample for each feed's latest upload.
 - `include_diagnostics` (bool, default true): Include Meta's catalog diagnostic groups.
 
-Needs `catalog_management` and access to the catalog. Sections fail independently. Beyond schedule staleness it flags an upload that failed before reading any item (`upload_failed`, with Meta's fatal error text as the reason, e.g. an expired feed credential), an unscheduled feed with no upload for 30+ days (`feed_inactive`), and a catalog with only supplementary feeds (`no_primary_feed`, info): its main product data probably comes from an integration such as Shopify, which does not appear as a feed, so these checks cannot tell whether that data is fresh. Staleness is only checked for scheduled feeds (manual/API-fed catalogs have no expected cadence). Flag thresholds (invalid items >= 5% / 20%, item drop >= 20%, 2x missed schedule) are operator heuristics; error and diagnostic text comes from Meta. Generating Meta's full downloadable error report is a POST and is not exposed.
+Needs `catalog_management` and access to the catalog. Sections fail independently. A scheduled feed whose last upload is both over 7 days old and over 10x its interval is rated CRITICAL (`feed looks dead`); otherwise stale means more than 2x the interval (a daily feed 27h old is fine, 49h is not). Staleness uses `schedule`, or `update_schedule` for update-only / supplementary feeds. A feed with products but no visible upload sessions is an info note (`upload_sessions_not_visible`), not a failure. The response includes the catalog's name and counts, and an info note when Meta's `feed_count` is higher than the feeds the feeds edge returns. Feed URLs, usernames and passwords are never returned: schedules keep only the cadence and the host the feed is fetched from (`source_host`); `get_catalog_info` redacts feeds the same way. Beyond schedule staleness it flags an upload that failed before reading any item (`upload_failed`, with Meta's fatal error text as the reason, e.g. an expired feed credential), an unscheduled feed with no upload for 30+ days (`feed_inactive`), and a catalog with only supplementary feeds (`no_primary_feed`, info): its main product data probably comes from an integration such as Shopify, which does not appear as a feed, so these checks cannot tell whether that data is fresh. Staleness is only checked for scheduled feeds (manual/API-fed catalogs have no expected cadence). Flag thresholds (invalid items >= 5% / 20%, item drop >= 20%, 2x missed schedule) are operator heuristics; error and diagnostic text comes from Meta. Generating Meta's full downloadable error report is a POST and is not exposed.
 
 ## Phase v1.1 Wave 5b - Opportunity Score (1 tool)
 
