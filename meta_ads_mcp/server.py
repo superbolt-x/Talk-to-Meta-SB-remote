@@ -135,6 +135,8 @@ from meta_ads_mcp.core import creatives  # noqa: E402, F401
 from meta_ads_mcp.core import insights  # noqa: E402, F401
 from meta_ads_mcp.core import opportunity  # noqa: E402, F401
 from meta_ads_mcp.core import signals  # noqa: E402, F401
+from meta_ads_mcp.core import activity  # noqa: E402, F401
+from meta_ads_mcp.core import delivery  # noqa: E402, F401
 from meta_ads_mcp.core import pixels  # noqa: E402, F401
 from meta_ads_mcp.core import catalogs  # noqa: E402, F401
 from meta_ads_mcp.core import audiences  # noqa: E402, F401

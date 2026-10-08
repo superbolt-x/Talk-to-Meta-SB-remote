@@ -1321,23 +1321,29 @@ def _distinct_fix(fix: Any, message: str, *fallbacks: Any) -> Optional[str]:
 
 
 def _diagnostic_issues(group: dict) -> list[dict]:
+    """Ranked issues for a group. The group's own entries are updated with the same fix text, link and
+    severity, so the raw view and the ranked list never disagree."""
     if not group["issues"]:
         message = group.get("title") or group.get("type") or "Catalog issue"
-        return [{"severity": _issue_severity(group.get("severity"), group.get("type")), "check": group.get("type"),
+        issue = {"severity": _issue_severity(group.get("severity"), group.get("type")), "check": group.get("type"),
                  "message": message,
                  "fix": _distinct_fix(group.get("subtitle"), message) or GENERIC_CATALOG_FIX,
-                 "fix_url": group.get("fix_url") or COMMERCE_MANAGER_CATALOGS}]
+                 "fix_url": group.get("fix_url") or COMMERCE_MANAGER_CATALOGS}
+        group.update(fix=issue["fix"], fix_url=issue["fix_url"], issue_severity=issue["severity"])
+        return [issue]
     out = []
     for n in group["issues"]:
         src = n["event_source"] or {}
         where = f" ({src['event']} on {src['type'] or 'event source'} {src['id']})" if src.get("event") or src.get("id") else ""
         message = f"{n['description'] or n['type']}{where}"
-        out.append({
+        issue = {
             "severity": _issue_severity(group.get("severity"), n["type"]),
             "check": n["type"] or group.get("type"), "message": message,
             "fix": _distinct_fix(n["fix"], message, n["details"], group.get("subtitle")) or GENERIC_CATALOG_FIX,
             "fix_url": n["fix_url"] or group.get("fix_url") or COMMERCE_MANAGER_CATALOGS,
-        })
+        }
+        n.update(fix=issue["fix"], fix_url=issue["fix_url"], issue_severity=issue["severity"])
+        out.append(issue)
     return out
 
 
@@ -1418,18 +1424,21 @@ def get_catalog_readiness(catalog_id: str, connection_method: Optional[str] = No
         except MetaAPIError as e:
             notes.append(f"Pixel checks for {src.get('name') or src['id']} are not available: {e}")
             continue
-        checks = [{"key": c.get("key"), "title": _clean_meta_text(c.get("title")),
-                   "result": str(c.get("result", "")).lower() or None,
-                   "explanation": _clean_meta_text(c.get("user_message")),
-                   "description": _clean_meta_text(c.get("description")),
-                   "fix_url": _absolute_url(c.get("action_uri"))}
-                  for c in res.get("data", []) if isinstance(c, dict)]
+        checks = []
+        for c in (c for c in res.get("data", []) if isinstance(c, dict)):
+            entry = {"key": c.get("key"), "title": _clean_meta_text(c.get("title")),
+                     "result": str(c.get("result", "")).lower() or None,
+                     "description": _clean_meta_text(c.get("description")),
+                     "fix_url": _absolute_url(c.get("action_uri"))}
+            if c.get("user_message"):
+                entry["explanation"] = _clean_meta_text(c["user_message"])
+            checks.append(entry)
         pixel_checks.append({"pixel_id": src["id"], "name": src.get("name"), "checks": checks})
         for c in checks:
             if c["result"] == "failed":
                 issues.append({"severity": SEVERITY_HIGH, "check": c["key"],
                                "message": f"{src.get('name') or src['id']}: {c['title']}"
-                                          + (f": {c['explanation']}" if c["explanation"] else ""),
+                                          + (f": {c['explanation']}" if c.get("explanation") else ""),
                                "fix": c["description"] or "Open the fix link for Meta's steps.",
                                "fix_url": c["fix_url"]})
     if pixel_checks:

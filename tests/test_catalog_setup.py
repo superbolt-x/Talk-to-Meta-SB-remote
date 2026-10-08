@@ -144,6 +144,32 @@ class TestReadiness:
         assert out["issues"][0]["message"] == "Items not shown in dynamic ads"
 
 
+class TestRawViewsMatchRankedIssues:
+    """Seen live: an out-of-stock item had fix_url null in dynamic_ads_issues but the Commerce Manager link in issues."""
+
+    def test_nested_entries_carry_the_same_fix_link_and_severity_as_the_ranked_issue(self, monkeypatch):
+        stock = {"type": "PRODUCT_OUT_OF_STOCK", "description": "1 item is out of stock"}
+        group = {"type": "PRODUCT_ISSUES", "severity": "MUST_FIX", "title": "Items", "diagnostics": [stock]}
+        out, _ = readiness(monkeypatch, da=[group])
+        nested = out["dynamic_ads_issues"][0]["issues"][0]
+        ranked = out["issues"][0]
+        assert nested["fix_url"] == ranked["fix_url"] == "https://business.facebook.com/commerce/catalogs"
+        assert nested["fix"] == ranked["fix"] and nested["issue_severity"] == ranked["severity"] == "LOW"
+
+    def test_a_group_without_nested_detail_is_updated_too(self, monkeypatch):
+        out, _ = readiness(monkeypatch, da=[DA_GROUP])
+        raw, ranked = out["dynamic_ads_issues"][0], out["issues"][0]
+        assert raw["fix_url"] == ranked["fix_url"] and raw["fix"] == ranked["fix"]
+        assert raw["issue_severity"] == "HIGH"
+
+    def test_a_pixel_check_without_a_message_has_no_null_explanation_key(self, monkeypatch):
+        failing = {"key": "k", "title": "Low match rate", "result": "failed", "description": "Fewer than half match."}
+        out, _ = readiness(monkeypatch, pixel={"data": [failing]})
+        assert "explanation" not in out["pixel_checks"][0]["checks"][0]
+        assert out["pixel_checks"][0]["checks"][0]["description"] == "Fewer than half match."
+        assert out["issues"][0]["fix"] == "Fewer than half match."
+
+
 class TestReadinessPixelChecks:
     def test_a_failed_pixel_check_blocks_and_carries_metas_explanation(self, monkeypatch):
         out, _ = readiness(monkeypatch, pixel={"data": [PIXEL_PASS, PIXEL_FAIL]})
