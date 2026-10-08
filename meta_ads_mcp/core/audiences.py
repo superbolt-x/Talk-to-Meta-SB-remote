@@ -14,7 +14,7 @@ from typing import Optional
 from meta_ads_mcp.server import mcp
 from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
-from meta_ads_mcp.core.utils import ensure_account_id_format
+from meta_ads_mcp.core.utils import ensure_account_id_format, truncation_fields
 
 logger = logging.getLogger("meta-ads-mcp.audiences")
 
@@ -203,6 +203,7 @@ def list_custom_audiences(
             )
             next_batch = result.get("data", [])
             if not next_batch:
+                paging = {}
                 break
             all_audiences.extend(next_batch)
             paging = result.get("paging", {})
@@ -229,6 +230,7 @@ def list_custom_audiences(
         return {
             "account_id": account_id,
             "total": len(all_audiences),
+            **truncation_fields(paging, len(all_audiences)),
             "subtype_breakdown": subtype_counts,
             "unusable_count": unusable_count,
             "total_warnings": total_warnings,

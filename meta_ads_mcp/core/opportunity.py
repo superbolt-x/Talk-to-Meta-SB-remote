@@ -26,6 +26,8 @@ logger = logging.getLogger("meta-ads-mcp.opportunity")
 # Meta documents a 45-day maximum window and ~2 days of latency on the history API.
 MAX_HISTORY_DAYS = 45
 HISTORY_LATENCY_DAYS = 2
+# Gap (points) between live score and last history value worth explaining. Operator heuristic.
+LIVE_VS_HISTORY_GAP_NOTE = 5
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -82,6 +84,22 @@ def _summarize_history(rows: list[dict]) -> dict:
         "min": min(r["opportunity_score"] for r in scored),
         "max": max(r["opportunity_score"] for r in scored),
     }
+
+
+def _live_vs_history_note(live: Optional[float], summary: dict) -> Optional[str]:
+    """Explain a gap between the live score and the last history point instead of leaving it a mystery."""
+    if live is None or not summary:
+        return None
+    gap = round(live - summary["end_score"], 2)
+    if abs(gap) < LIVE_VS_HISTORY_GAP_NOTE:
+        return None
+    return (
+        f"The live score ({live:g}) is {abs(gap):g} points {'above' if gap > 0 else 'below'} the last "
+        f"history value ({summary['end_score']:g} on {summary['to']}). History lags about "
+        f"{HISTORY_LATENCY_DAYS} days and Meta notes the live score can differ from the historical "
+        "series, so this is not necessarily an error. Set explain_history=true to see which "
+        "campaign changes moved the score."
+    )
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -171,6 +189,9 @@ def get_opportunity_score(
             rows.sort(key=lambda r: r.get("date") or "")
             response["history"] = rows
             response["history_summary"] = _summarize_history(rows)
+            gap_note = _live_vs_history_note(response.get("opportunity_score"), response["history_summary"])
+            if gap_note:
+                response["history_summary"]["live_vs_history_note"] = gap_note
             if history_days > MAX_HISTORY_DAYS:
                 response["history_note"] = f"history_days capped at Meta's {MAX_HISTORY_DAYS}-day maximum."
         except MetaAPIError as e:

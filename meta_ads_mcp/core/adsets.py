@@ -39,6 +39,7 @@ from meta_ads_mcp.core.utils import (
     format_budget_cents_to_currency,
     currency_to_cents,
     get_account_currency,
+    truncation_fields,
 )
 
 logger = logging.getLogger("meta-ads-mcp.adsets")
@@ -135,6 +136,7 @@ def get_adsets(
             result = api_client.graph_get(endpoint, fields=ADSET_LIST_FIELDS, params=params)
             next_adsets = result.get("data", [])
             if not next_adsets:
+                paging = {}
                 break
             for a in next_adsets:
                 if a.get("daily_budget"):
@@ -153,6 +155,7 @@ def get_adsets(
         return {
             "total": len(all_adsets),
             "status_counts": status_counts,
+            **truncation_fields(paging, len(all_adsets)),
             "currency": currency,
             "adsets": all_adsets,
             "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
