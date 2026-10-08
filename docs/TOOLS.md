@@ -86,7 +86,7 @@ Anomalies and trends computed from daily Insights ("anything unusual lately?", "
 - `top_n` (int, default 10, max 25): entities to scan, ranked by spend over the whole window.
 - `metrics` (str, optional): comma-separated subset of spend, impressions, ctr, cpm, cpc, frequency, purchases, cpa, roas, revenue, leads, cpl, conversions, cost_per_conversion. Default follows `archetype` and skips metrics with no data.
 - `archetype` (str, default 'hybrid'): 'ecommerce', 'lead_gen' or 'hybrid'.
-- `conversion_action_type` (str, optional): also analyze one specific action type (e.g. a custom conversion) as `conversions` / `cost_per_conversion`.
+- `conversion_action_type` (str, optional): also analyze one specific action type (e.g. a custom conversion) as `conversions` / `cost_per_conversion`. If it has no events in the window (misspelled, or the conversion has not fired lately) a note says so; those metrics are not judged. Explicitly requested `metrics` with no data are named in a note too.
 - `include_daily` (bool, default false): add the object's daily series to `trend.daily`.
 - `min_spend_share` (float, default 0.005, 0-0.5): entities spending under this share of the scanned total over the baseline are skipped as too small to matter (0 disables). It does not apply to `level='self'`.
 
@@ -175,6 +175,8 @@ Flags (our heuristics, not Meta's): `volume_drop` (the last complete day is 50%+
 An ad account's custom conversions: name, rule, event type, default value, when each first and last fired, and a status (`active`, `stale` after 30 days without firing, `never_fired`, `unavailable`, `archived`). Each carries `insights_action_type` (`offsite_conversion.custom.<id>`), the exact action type it has in Insights: pass it as `conversion_action_type` to `get_performance_signals` to analyze that conversion's cost and volume.
 - `account_id` (str): Ad account ID.
 - `include_archived` (bool, default false): also list archived conversions.
+
+A rule longer than 1,000 characters is cut and flagged `rule_truncated`.
 
 ## Phase v1.1 Wave 5 - Catalog & Connections (11 tools)
 

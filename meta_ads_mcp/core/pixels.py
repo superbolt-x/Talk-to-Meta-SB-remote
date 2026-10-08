@@ -1009,7 +1009,7 @@ CUSTOM_CONVERSION_FIELDS = [
 CUSTOM_CONVERSION_FIELDS_BASIC = ["id", "name", "rule", "custom_event_type", "last_fired_time", "is_archived"]
 CUSTOM_CONVERSION_STALE_DAYS = 30  # operator heuristic: no fire for this long is worth a look
 CUSTOM_CONVERSION_PAGE = 100       # Meta allows at most 100 custom conversions per ad account
-MAX_RULE_CHARS = 400
+MAX_RULE_CHARS = 1000
 
 
 def _parse_iso(value: Any) -> Optional[datetime]:
@@ -1080,9 +1080,11 @@ def list_custom_conversions(account_id: str, include_archived: bool = False) -> 
         else:
             status = "active"
         rule = raw.get("rule")
+        rule_cut = isinstance(rule, str) and len(rule) > MAX_RULE_CHARS
         conversions.append({
             "id": raw.get("id"), "name": raw.get("name"), "description": raw.get("description"),
-            "rule": rule[:MAX_RULE_CHARS] if isinstance(rule, str) else rule,
+            "rule": rule[:MAX_RULE_CHARS] if rule_cut else rule,
+            **({"rule_truncated": True} if rule_cut else {}),
             "custom_event_type": raw.get("custom_event_type"),
             "default_value": raw.get("default_conversion_value"),
             "event_source_type": raw.get("event_source_type"),

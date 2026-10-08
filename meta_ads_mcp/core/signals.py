@@ -699,8 +699,20 @@ def get_performance_signals(
 
     window_agg = _aggregate(_window(object_days, all_dates))
     selected = requested or _default_metrics(archetype, conversion_action_type)
+    no_data = [m for m in selected if not _has_data(m, window_agg)]
     if not requested:
-        selected = [m for m in selected if _has_data(m, window_agg)]
+        selected = [m for m in selected if m not in no_data]
+
+    # A metric with nothing behind it is never judged; say so rather than let it pass as clean.
+    data_notes: list[str] = []
+    if conversion_action_type and window_agg["conversions"] == 0:
+        data_notes.append(
+            f"No '{conversion_action_type}' events in the {len(all_dates)}-day window, so conversions and "
+            f"cost_per_conversion were not judged. Check the action type is spelled right and that it has "
+            f"fired recently (list_custom_conversions shows when each custom conversion last fired).")
+    unjudged = [m for m in no_data if requested and not (conversion_action_type and m in ("conversions", "cost_per_conversion"))]
+    if unjudged:
+        data_notes.append(f"No data in the window for {', '.join(unjudged)}, so they were not judged.")
 
     response["trend"] = build_trend(object_days, until, selected)
     if include_daily:
@@ -748,7 +760,7 @@ def get_performance_signals(
     anomalies: list[dict] = []
     skipped: list[dict] = []
     low_volume: list[dict] = []
-    notes: list[str] = []
+    notes: list[str] = list(data_notes)
     scope_spend = sum((object_days.get(dt) or {}).get("spend", 0.0) for dt in baseline_dates)
     for entity in entities:
         if level != "self" and min_spend_share > 0 and scope_spend > 0:
