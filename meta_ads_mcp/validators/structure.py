@@ -25,7 +25,7 @@ ARCHETYPE_OBJECTIVES = {
     "saas": ["Leads", "Traffic", "Awareness"],
 }
 
-# Budget sanity thresholds (EUR/day minimum per objective)
+# Budget sanity thresholds (minimum per day per objective, in account currency units)
 MIN_DAILY_BUDGET = {
     "Sales": 5.0,
     "Traffic": 3.0,
@@ -54,7 +54,7 @@ def validate_campaign_structure(
     objective: str,
     archetype: str,
     budget: float,
-    currency: str = "EUR",
+    currency: str = "",
 ) -> dict:
     """
     Validate campaign structure against archetype requirements.
@@ -89,14 +89,15 @@ def validate_campaign_structure(
     # --- Budget sanity check ---
     if budget is not None and budget > 0:
         min_budget = MIN_DAILY_BUDGET.get(objective, 3.0)
+        unit = f" {currency}" if currency else ""
         if budget < min_budget:
             warnings.append(
-                f"Daily budget {budget} {currency} is below recommended minimum "
-                f"{min_budget} {currency} for '{objective}' objective"
+                f"Daily budget {budget}{unit} is below recommended minimum "
+                f"{min_budget}{unit} for '{objective}' objective"
             )
         elif budget > 500:
             warnings.append(
-                f"Daily budget {budget} {currency} is unusually high - "
+                f"Daily budget {budget}{unit} is unusually high - "
                 "confirm this is intentional"
             )
 

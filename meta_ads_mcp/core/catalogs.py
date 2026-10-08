@@ -10,6 +10,8 @@ gaps, stale feeds, rejected products, and ecommerce readiness issues.
 Phase: v1.1 (Read) / v1.3 (Write)
 """
 import logging
+import re
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from meta_ads_mcp.server import mcp
@@ -133,8 +135,8 @@ def get_catalog_products(
             price_str = p.get("price", "")
             if price_str:
                 try:
-                    # Price format: "€33.00" or "33.00 EUR" or just "3300"
-                    cleaned = price_str.replace("€", "").replace("EUR", "").replace(",", ".").strip()
+                    # Price format: "€33.00", "$33.00", "33.00 USD" or just "3300"
+                    cleaned = re.sub(r"[^\d.,-]", "", price_str).replace(",", ".").strip()
                     price_val = float(cleaned)
                     if price_val > 500:  # Likely in cents
                         price_val /= 100
@@ -153,7 +155,7 @@ def get_catalog_products(
                 "min": round(min(price_values), 2),
                 "max": round(max(price_values), 2),
                 "avg": round(sum(price_values) / len(price_values), 2),
-                "currency": products[0].get("currency", "EUR") if products else "EUR",
+                "currency": products[0].get("currency") if products else None,
             }
 
         return {
@@ -561,3 +563,330 @@ def update_product_set(
         "updated_fields": list(payload.keys()),
         "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
     }
+
+
+# --- Feed health: upload sessions, upload errors, catalog diagnostics ---
+
+# Operator heuristics for flagging, NOT Meta-published thresholds.
+FEED_STALE_FACTOR = 2.0         # flag a scheduled feed after missing this many intervals
+INVALID_RATIO_CRITICAL = 0.20   # >=20% of detected items invalid in the latest upload
+INVALID_RATIO_HIGH = 0.05       # >=5%
+ITEM_DROP_HIGH_PCT = 20.0       # persisted items fell this much vs the previous upload
+MAX_UPLOADS = 10
+MAX_ERROR_SAMPLES = 3           # sample rows/products kept per error
+
+SCHEDULE_INTERVAL_HOURS = {"HOURLY": 1, "DAILY": 24, "WEEKLY": 168, "MONTHLY": 720}
+
+FEED_FIELDS_RICH = [
+    "id", "name", "file_name", "ingestion_source_type", "item_count",
+    "product_count", "schedule", "update_schedule", "latest_upload",
+]
+FEED_FIELDS_BASIC = ["id", "name", "product_count", "latest_upload", "schedule"]
+UPLOAD_FIELDS = [
+    "id", "start_time", "end_time", "error_count", "warning_count",
+    "num_detected_items", "num_invalid_items", "num_persisted_items",
+    "num_deleted_items", "input_method", "filename",
+]
+DIAGNOSTIC_FIELDS = [
+    "type", "severity", "title", "subtitle", "number_of_affected_items",
+    "number_of_affected_entities", "affected_channels", "affected_entity",
+    "affected_features", "error_code",
+]
+DIAGNOSTIC_FIELDS_BASIC = ["type", "severity", "title", "number_of_affected_items"]
+
+_SEVERITY_ORDER = {SEVERITY_CRITICAL: 0, SEVERITY_HIGH: 1, SEVERITY_MEDIUM: 2, SEVERITY_LOW: 3, SEVERITY_INFO: 4}
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_meta_time(value: Any) -> Optional[datetime]:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("+0000", "+00:00").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _schedule_interval_hours(schedule: Any) -> Optional[float]:
+    """Expected hours between fetches for a scheduled feed, or None (manual / API feed)."""
+    if not isinstance(schedule, dict):
+        return None
+    base = SCHEDULE_INTERVAL_HOURS.get(str(schedule.get("interval", "")).upper())
+    if base is None:
+        return None
+    count = _int(schedule.get("interval_count")) or 1
+    return float(base * max(count, 1))
+
+
+def _normalize_upload(raw: dict) -> dict:
+    detected = _int(raw.get("num_detected_items"))
+    invalid = _int(raw.get("num_invalid_items"))
+    return {
+        "id": raw.get("id"),
+        "start_time": raw.get("start_time"),
+        "end_time": raw.get("end_time"),
+        "completed": bool(raw.get("end_time")),
+        "input_method": raw.get("input_method"),
+        "filename": raw.get("filename"),
+        "items_detected": detected,
+        "items_persisted": _int(raw.get("num_persisted_items")),
+        "items_invalid": invalid,
+        "items_deleted": _int(raw.get("num_deleted_items")),
+        "error_count": _int(raw.get("error_count")),
+        "warning_count": _int(raw.get("warning_count")),
+        "invalid_ratio": round(invalid / detected, 4) if invalid is not None and detected else None,
+    }
+
+
+def _assess_feed(feed: dict, uploads: list[dict], now: datetime) -> list[dict]:
+    """Severity-ranked issues for one feed from its schedule and recent uploads (newest first)."""
+    issues: list[dict] = []
+    label = feed.get("name") or feed.get("id")
+
+    def add(severity: str, check: str, message: str, fix: str) -> None:
+        issues.append({"severity": severity, "check": check, "feed_id": feed.get("id"),
+                       "message": f"{label}: {message}", "fix": fix})
+
+    if not uploads:
+        add(SEVERITY_HIGH, "feed_never_uploaded", "no upload sessions found",
+            "Check the feed URL/schedule in Commerce Manager and trigger a manual upload.")
+        return issues
+
+    latest = uploads[0]
+    started = _parse_meta_time(latest["start_time"])
+    ended = _parse_meta_time(latest["end_time"])
+
+    # Staleness: scheduled feeds only; a manual/API feed has no expected cadence.
+    interval = _schedule_interval_hours(feed.get("schedule"))
+    reference = ended or started
+    if interval and reference:
+        age_h = (now - reference).total_seconds() / 3600
+        if age_h > interval * FEED_STALE_FACTOR:
+            add(SEVERITY_HIGH, "feed_stale",
+                f"last upload {age_h:.0f}h ago, schedule expects one every {interval:.0f}h",
+                "Confirm the feed URL is reachable and returns the file; check fetch errors in Commerce Manager.")
+
+    if not latest["completed"] and started and (now - started).total_seconds() > 2 * 3600:
+        add(SEVERITY_MEDIUM, "upload_not_finished",
+            "latest upload started over 2h ago and has not finished",
+            "Very large or slow feed file; check the feed host's response time.")
+
+    detected, persisted = latest["items_detected"], latest["items_persisted"]
+    if latest["completed"] and detected and persisted == 0:
+        add(SEVERITY_CRITICAL, "no_items_persisted",
+            f"latest upload detected {detected} items but none were accepted",
+            "Fix the fatal feed errors below; no products from this upload reached the catalog.")
+
+    ratio = latest["invalid_ratio"]
+    if ratio is not None and ratio > 0 and persisted != 0:
+        pct = f"{ratio:.0%}"
+        detail = f"{pct} of items in the latest upload are invalid ({latest['items_invalid']} of {detected})"
+        fix = "Fix the fatal errors listed for this upload; invalid items are not created or updated."
+        if ratio >= INVALID_RATIO_CRITICAL:
+            add(SEVERITY_CRITICAL, "invalid_items", detail, fix)
+        elif ratio >= INVALID_RATIO_HIGH:
+            add(SEVERITY_HIGH, "invalid_items", detail, fix)
+        else:
+            add(SEVERITY_MEDIUM, "invalid_items", detail, fix)
+
+    # Catalog shrinkage vs the previous completed upload (replace feeds delete missing items).
+    previous = next((u for u in uploads[1:] if u["completed"] and u["items_persisted"]), None)
+    if latest["completed"] and previous and persisted is not None:
+        drop = (previous["items_persisted"] - persisted) / previous["items_persisted"] * 100
+        if drop >= ITEM_DROP_HIGH_PCT:
+            add(SEVERITY_HIGH, "item_count_drop",
+                f"accepted items fell {drop:.0f}% ({previous['items_persisted']} -> {persisted}) vs the previous upload",
+                "Check whether the feed file was truncated or products were filtered out upstream.")
+
+    warnings = latest["warning_count"]
+    if warnings and not issues:
+        add(SEVERITY_LOW, "upload_warnings", f"latest upload has {warnings} warning(s)",
+            "Warnings omit malformed optional fields; review the sampled errors below.")
+    return issues
+
+
+def _normalize_error(raw: dict) -> dict:
+    samples = ((raw.get("samples") or {}).get("data")) or []
+    return {
+        "id": raw.get("id"),
+        "severity": str(raw.get("severity", "")).lower() or None,
+        "summary": raw.get("summary"),
+        "description": raw.get("description"),
+        "samples": [
+            {"row_number": x.get("row_number"), "retailer_id": x.get("retailer_id"), "product_id": x.get("id")}
+            for x in samples[:MAX_ERROR_SAMPLES] if isinstance(x, dict)
+        ],
+    }
+
+
+def _graph_with_fallback(endpoint: str, rich: list[str], basic: Optional[list[str]], params: Optional[dict] = None) -> dict:
+    """GET with `rich` fields; if Meta rejects one (code 100) retry with `basic` (None = no fields)."""
+    try:
+        return api_client.graph_get(endpoint, fields=rich, params=params)
+    except MetaAPIError as e:
+        if e.error_code != 100:
+            raise
+        return api_client.graph_get(endpoint, fields=basic, params=params)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_catalog_feed_health(
+    catalog_id: str,
+    feed_id: Optional[str] = None,
+    upload_limit: int = 5,
+    include_errors: bool = True,
+    include_diagnostics: bool = True,
+) -> dict:
+    """
+    Check the health of a product catalog's feeds: recent upload sessions (accepted vs
+    invalid items, item-count drops, staleness against the schedule), a sample of the
+    latest upload's errors and warnings, and Meta's catalog-level diagnostics
+    (MUST_FIX issues such as missing/invalid attributes, image quality, policy violations).
+
+    Read-only. Needs the catalog_management permission and access to the catalog.
+    Flag thresholds are operator heuristics; error and diagnostic text comes from Meta.
+
+    Args:
+        catalog_id: Product catalog ID.
+        feed_id: Only check this feed. Default: every feed on the catalog.
+        upload_limit: Recent upload sessions to inspect per feed (default 5, max 10).
+        include_errors: Include Meta's error/warning sample for each feed's latest upload.
+        include_diagnostics: Include Meta's catalog-level diagnostic groups.
+    """
+    api_client._ensure_initialized()
+    catalog_id = str(catalog_id).strip()
+    upload_limit = max(1, min(int(upload_limit), MAX_UPLOADS))
+    now = _utcnow()
+
+    response: dict[str, Any] = {"catalog_id": catalog_id}
+    errors: dict[str, str] = {}
+    issues: list[dict] = []
+
+    # --- Feeds ---
+    feeds: list[dict] = []
+    try:
+        if feed_id:
+            feeds = [_graph_with_fallback(f"/{str(feed_id).strip()}", FEED_FIELDS_RICH, FEED_FIELDS_BASIC)]
+        else:
+            raw = _graph_with_fallback(f"/{catalog_id}/product_feeds", FEED_FIELDS_RICH, FEED_FIELDS_BASIC)
+            feeds = [f for f in raw.get("data", []) if isinstance(f, dict)]
+    except MetaAPIError as e:
+        errors["feeds"] = str(e)
+
+    feed_reports: list[dict] = []
+    for feed in feeds:
+        fid = feed.get("id")
+        report: dict[str, Any] = {
+            "id": fid,
+            "name": feed.get("name"),
+            "file_name": feed.get("file_name"),
+            "ingestion_source_type": feed.get("ingestion_source_type"),
+            "schedule": feed.get("schedule"),
+            "product_count": feed.get("product_count", feed.get("item_count")),
+        }
+
+        raw_uploads: list[dict] = []
+        try:
+            res = _graph_with_fallback(f"/{fid}/uploads", UPLOAD_FIELDS, None, params={"limit": str(upload_limit)})
+            raw_uploads = [u for u in res.get("data", []) if isinstance(u, dict)]
+        except MetaAPIError as e:
+            errors[f"uploads:{fid}"] = str(e)
+        if not raw_uploads and isinstance(feed.get("latest_upload"), dict) and feed["latest_upload"].get("id"):
+            raw_uploads = [feed["latest_upload"]]  # fall back to the summary embedded on the feed
+
+        uploads = sorted(
+            (_normalize_upload(u) for u in raw_uploads),
+            key=lambda u: _parse_meta_time(u["start_time"]) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )[:upload_limit]
+        report["recent_uploads"] = uploads
+        if "uploads:" + str(fid) not in errors:
+            feed_issues = _assess_feed(feed, uploads, now)
+            report["issues"] = feed_issues
+            issues.extend(feed_issues)
+
+        if include_errors and uploads:
+            try:
+                res = api_client.graph_get(f"/{uploads[0]['id']}/errors", params={"limit": "25"})
+                sampled = [_normalize_error(e) for e in res.get("data", []) if isinstance(e, dict)]
+                sampled.sort(key=lambda e: 0 if e["severity"] == "fatal" else 1)
+                report["latest_upload_errors"] = sampled
+                total = (res.get("summary") or {}).get("total_count")
+                if total is not None:
+                    report["latest_upload_error_total"] = total
+            except MetaAPIError as e:
+                errors[f"errors:{fid}"] = str(e)
+        feed_reports.append(report)
+
+    response["feeds"] = feed_reports
+    if not feeds and "feeds" not in errors:
+        issues.append({
+            "severity": SEVERITY_INFO, "check": "feed_exists", "feed_id": None,
+            "message": "No product feed on this catalog. It may be managed manually, via Shops, or a partner integration.",
+            "fix": "Nothing to check here; use get_catalog_products for item-level status.",
+        })
+
+    # --- Catalog diagnostics ---
+    if include_diagnostics:
+        try:
+            res = _graph_with_fallback(f"/{catalog_id}/diagnostics", DIAGNOSTIC_FIELDS, DIAGNOSTIC_FIELDS_BASIC)
+            groups = [
+                {
+                    "type": g.get("type"),
+                    "severity": g.get("severity"),
+                    "title": g.get("title"),
+                    "subtitle": g.get("subtitle"),
+                    "affected_items": _int(g.get("number_of_affected_items")),
+                    "affected_entity": g.get("affected_entity"),
+                    "affected_channels": g.get("affected_channels"),
+                    "affected_features": g.get("affected_features"),
+                }
+                for g in res.get("data", []) if isinstance(g, dict)
+            ]
+            groups.sort(key=lambda g: (0 if g["severity"] == "MUST_FIX" else 1, -(g["affected_items"] or 0)))
+            response["diagnostics"] = groups
+            for g in groups:
+                must_fix = g["severity"] == "MUST_FIX"
+                issues.append({
+                    "severity": SEVERITY_HIGH if must_fix else SEVERITY_LOW,
+                    "check": "catalog_diagnostic",
+                    "feed_id": None,
+                    "message": f"{g['title'] or g['type']}"
+                               + (f" ({g['affected_items']} items)" if g["affected_items"] else ""),
+                    "fix": g["subtitle"] or "See Commerce Manager > Catalog > Diagnostics for the affected items.",
+                })
+        except MetaAPIError as e:
+            errors["diagnostics"] = str(e)
+
+    issues.sort(key=lambda i: _SEVERITY_ORDER.get(i["severity"], 5))
+    critical = sum(1 for i in issues if i["severity"] == SEVERITY_CRITICAL)
+    high = sum(1 for i in issues if i["severity"] == SEVERITY_HIGH)
+    actionable = [i for i in issues if i["severity"] != SEVERITY_INFO]
+    response["health"] = (
+        "degraded" if critical else "partial" if high
+        else "healthy_with_warnings" if actionable else "healthy"
+    )
+    response["issue_count"] = len(issues)
+    response["issues"] = issues
+
+    if errors:
+        response["errors"] = errors
+        response["hint"] = (
+            "Meta rejected part of this request. Feed health needs the catalog_management permission and "
+            "access to this catalog (Commerce Manager > Catalog > Settings > Partners / People)."
+        )
+        if response["health"] == "healthy":
+            response["health"] = "unknown"  # nothing was flagged, but part of the data could not be read
+    response["rate_limit_usage_pct"] = api_client.rate_limits.max_usage_pct
+    return response

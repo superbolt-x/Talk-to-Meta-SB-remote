@@ -15,7 +15,11 @@ from typing import Optional
 from meta_ads_mcp.server import mcp
 from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
-from meta_ads_mcp.core.utils import ensure_account_id_format, format_budget_cents_to_currency
+from meta_ads_mcp.core.utils import (
+    ensure_account_id_format,
+    format_budget_cents_to_currency,
+    get_account_currency,
+)
 
 logger = logging.getLogger("meta-ads-mcp.campaigns")
 
@@ -46,7 +50,7 @@ CAMPAIGN_LIST_FIELDS = [
 
 # Campaign fields for detail view (full)
 CAMPAIGN_DETAIL_FIELDS = CAMPAIGN_LIST_FIELDS + [
-    "bid_strategy", "budget_rebalance_flag",
+    "account_id", "bid_strategy", "budget_rebalance_flag",
     "special_ad_categories", "special_ad_category_country",
     "spend_cap", "configured_status",
     "pacing_type", "promoted_object",
@@ -74,6 +78,7 @@ def get_campaigns(
     account_id = ensure_account_id_format(account_id)
 
     params = {"limit": str(min(limit, 100))}
+    currency = get_account_currency(account_id)
 
     if status_filter and status_filter.upper() != "ALL":
         status_val = status_filter.upper()
@@ -93,9 +98,9 @@ def get_campaigns(
         # Enrich with human-readable budget
         for c in campaigns:
             if c.get("daily_budget"):
-                c["daily_budget_display"] = format_budget_cents_to_currency(c["daily_budget"])
+                c["daily_budget_display"] = format_budget_cents_to_currency(c["daily_budget"], currency)
             if c.get("lifetime_budget"):
-                c["lifetime_budget_display"] = format_budget_cents_to_currency(c["lifetime_budget"])
+                c["lifetime_budget_display"] = format_budget_cents_to_currency(c["lifetime_budget"], currency)
 
         # Handle pagination - collect all pages if more than one
         all_campaigns = list(campaigns)
@@ -118,9 +123,9 @@ def get_campaigns(
                 break
             for c in next_campaigns:
                 if c.get("daily_budget"):
-                    c["daily_budget_display"] = format_budget_cents_to_currency(c["daily_budget"])
+                    c["daily_budget_display"] = format_budget_cents_to_currency(c["daily_budget"], currency)
                 if c.get("lifetime_budget"):
-                    c["lifetime_budget_display"] = format_budget_cents_to_currency(c["lifetime_budget"])
+                    c["lifetime_budget_display"] = format_budget_cents_to_currency(c["lifetime_budget"], currency)
             all_campaigns.extend(next_campaigns)
             paging = result.get("paging", {})
             page_count += 1
@@ -135,6 +140,7 @@ def get_campaigns(
             "total": len(all_campaigns),
             "status_counts": status_counts,
             "pages_fetched": page_count,
+            "currency": currency,
             "campaigns": all_campaigns,
             "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
         }
@@ -160,11 +166,13 @@ def get_campaign_details(campaign_id: str) -> dict:
             fields=CAMPAIGN_DETAIL_FIELDS,
         )
 
-        # Enrich budget display
+        # Enrich budget display in the account's own currency
+        currency = get_account_currency(result.get("account_id"))
+        result["currency"] = currency
         if result.get("daily_budget"):
-            result["daily_budget_display"] = format_budget_cents_to_currency(result["daily_budget"])
+            result["daily_budget_display"] = format_budget_cents_to_currency(result["daily_budget"], currency)
         if result.get("lifetime_budget"):
-            result["lifetime_budget_display"] = format_budget_cents_to_currency(result["lifetime_budget"])
+            result["lifetime_budget_display"] = format_budget_cents_to_currency(result["lifetime_budget"], currency)
 
         # Get child ad set count
         try:
@@ -481,7 +489,7 @@ def update_campaign(
     Args:
         campaign_id: Campaign ID to update.
         name: New campaign name. Subject to naming enforcement.
-        daily_budget: New daily budget in currency units (e.g., 50.0 for EUR 50).
+        daily_budget: New daily budget in currency units (e.g., 50.0 for 50.00 in the account's currency).
             Mutually exclusive with lifetime_budget.
         lifetime_budget: New lifetime budget in currency units.
             Mutually exclusive with daily_budget.

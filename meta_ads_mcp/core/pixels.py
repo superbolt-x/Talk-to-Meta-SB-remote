@@ -562,3 +562,235 @@ def run_tracking_diagnostic(
         "alignment_warnings": len(alignment_warnings),
         "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
     }
+
+
+# --- Dataset Quality API (event match quality, dedupe, coverage, freshness) ---
+
+# Operator heuristics for flagging, NOT Meta-published thresholds. Meta's own targets
+# (e.g. event coverage goal_percentage) are read from the API response where available.
+EMQ_HIGH_BELOW = 4.0      # < 4/10: weak matching, attribution and optimization suffer
+EMQ_MEDIUM_BELOW = 6.0    # < 6/10: room to improve with more customer-info parameters
+DEDUPE_KEY_MIN_PCT = 90.0  # event_id should be on (nearly) every browser and server event
+
+# One entry per metric group so a rejected field in one group cannot hide the rest.
+_DQ_GROUPS: dict[str, list[str]] = {
+    "event_match_quality": [
+        "event_match_quality{composite_score,match_key_feedback{identifier,coverage{percentage}}}",
+    ],
+    "diagnostics": ["event_match_quality{diagnostics}"],
+    "acr": ["acr{percentage,description}"],
+    "event_coverage": ["event_coverage{percentage,goal_percentage,description}"],
+    # Meta's docs spell this `dedupe_key_feedback` in queries and `dedup_key_feedback` in
+    # the field table; try the query spelling first, then the table spelling.
+    "dedupe": [
+        "dedupe_key_feedback{dedupe_key,browser_events_with_dedupe_key{percentage},"
+        "server_events_with_dedupe_key{percentage},overall_browser_coverage_from_dedupe_key{percentage}}",
+        "dedup_key_feedback{dedupe_key,browser_events_with_dedupe_key{percentage},"
+        "server_events_with_dedupe_key{percentage},overall_browser_coverage_from_dedupe_key{percentage}}",
+    ],
+    "data_freshness": ["data_freshness{upload_frequency,description}"],
+}
+
+
+# Everything in one request (the happy path). EMQ and its diagnostics share one selection.
+_DQ_COMBINED: list[str] = [
+    "event_match_quality{composite_score,match_key_feedback{identifier,coverage{percentage}},diagnostics}",
+    _DQ_GROUPS["acr"][0],
+    _DQ_GROUPS["event_coverage"][0],
+    _DQ_GROUPS["dedupe"][0],
+    _DQ_GROUPS["data_freshness"][0],
+]
+
+
+def _dq_query(dataset_id: str, selections: list[str], agent_name: Optional[str]) -> list[dict]:
+    """Run one /dataset_quality request and return its `web` array."""
+    params = {"dataset_id": dataset_id}
+    if agent_name:
+        params["agent_name"] = agent_name
+    fields = "web{" + ",".join(selections + ["event_name"]) + "}"
+    result = api_client.graph_get("/dataset_quality", params=params, fields=[fields])
+    web = result.get("web", [])
+    return web if isinstance(web, list) else []
+
+
+def _merge_events(target: dict[str, dict], web: list[dict]) -> None:
+    for entry in web:
+        name = entry.get("event_name")
+        if not name:
+            continue
+        merged = target.setdefault(name, {"event_name": name})
+        for key, value in entry.items():
+            if key == "event_name":
+                continue
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key].update(value)  # e.g. event_match_quality from two groups
+            else:
+                merged[key] = value
+
+
+def _assess_event(event: dict) -> list[dict]:
+    """Turn one event's raw quality data into severity-ranked issues."""
+    issues: list[dict] = []
+    name = event["event_name"]
+
+    emq = event.get("event_match_quality") or {}
+    score = emq.get("composite_score")
+    if isinstance(score, (int, float)):
+        if score < EMQ_MEDIUM_BELOW:
+            issues.append({
+                "severity": SEVERITY_HIGH if score < EMQ_HIGH_BELOW else SEVERITY_MEDIUM,
+                "check": "event_match_quality",
+                "event": name,
+                "message": f"{name}: event match quality {score}/10",
+                "fix": (
+                    "Send more customer-information parameters through the Conversions API "
+                    "(hashed email, phone, external_id, client IP and user agent, fbp/fbc)."
+                ),
+            })
+
+    coverage = event.get("event_coverage") or {}
+    pct, goal = coverage.get("percentage"), coverage.get("goal_percentage")
+    if isinstance(pct, (int, float)) and isinstance(goal, (int, float)) and pct < goal:
+        issues.append({
+            "severity": SEVERITY_MEDIUM,
+            "check": "event_coverage",
+            "event": name,
+            "message": f"{name}: Conversions API covers {pct}% of Pixel events (Meta goal {goal}%)",
+            "fix": "Send the same events from the server with a shared event_id so they deduplicate against the Pixel.",
+        })
+
+    dedupe_rows = event.get("dedupe_key_feedback") or event.get("dedup_key_feedback") or []
+    for row in dedupe_rows if isinstance(dedupe_rows, list) else []:
+        if row.get("dedupe_key") != "event_id":
+            continue
+        browser = (row.get("browser_events_with_dedupe_key") or {}).get("percentage")
+        server = (row.get("server_events_with_dedupe_key") or {}).get("percentage")
+        for side, value in (("browser", browser), ("server", server)):
+            if isinstance(value, (int, float)) and value < DEDUPE_KEY_MIN_PCT:
+                issues.append({
+                    "severity": SEVERITY_MEDIUM,
+                    "check": "dedupe_event_id",
+                    "event": name,
+                    "message": f"{name}: only {value}% of {side} events carry event_id",
+                    "fix": "Pass the same event_id from the browser Pixel and the server event so Meta can deduplicate.",
+                })
+
+    freshness = (event.get("data_freshness") or {}).get("upload_frequency")
+    if freshness and str(freshness).lower() not in ("real_time", "realtime"):
+        issues.append({
+            "severity": SEVERITY_LOW,
+            "check": "data_freshness",
+            "event": name,
+            "message": f"{name}: events arrive {freshness}, not in real time",
+            "fix": "Send server events as close to real time as possible.",
+        })
+
+    return issues
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def get_dataset_quality(
+    pixel_id: str,
+    event_name: Optional[str] = None,
+    agent_name: Optional[str] = None,
+) -> dict:
+    """
+    Get Meta's Dataset Quality for a pixel/dataset: event match quality (EMQ, 0-10) with
+    per-parameter match-key coverage, Conversions API event coverage, deduplication-key
+    coverage, additional conversions reported (ACR), data freshness, and Meta's own
+    diagnostics. Web events only.
+
+    Needs a token whose user has "Use events dataset" access on the pixel. Meta
+    recommends a long-lived system user token; client system user tokens are not supported.
+
+    Args:
+        pixel_id: Pixel / dataset ID (numeric string).
+        event_name: Only return this event (e.g., 'Purchase'). Default: all events.
+        agent_name: Only count events sent with this partner_agent. Normally leave unset.
+    """
+    api_client._ensure_initialized()
+    pixel_id = str(pixel_id).strip()
+    if not pixel_id.isdigit():
+        return {
+            "error": "pixel_id must be a numeric pixel/dataset ID",
+            "blocked_at": "input_validation",
+        }
+
+    events: dict[str, dict] = {}
+    unavailable: dict[str, str] = {}
+    mode = "combined"
+
+    try:
+        _merge_events(events, _dq_query(pixel_id, _DQ_COMBINED, agent_name))
+    except MetaAPIError as e:
+        if e.error_code != 100:  # 100 = invalid field/param; anything else won't be fixed by retrying per group
+            return _dataset_quality_error(pixel_id, e)
+        # A field in the combined request was rejected: query each group on its own.
+        mode = "per_metric_fallback"
+        events.clear()
+        last_error: Optional[MetaAPIError] = None
+        for group, variants in _DQ_GROUPS.items():
+            for selection in variants:
+                try:
+                    _merge_events(events, _dq_query(pixel_id, [selection], agent_name))
+                    unavailable.pop(group, None)
+                    break
+                except MetaAPIError as inner:
+                    last_error = inner
+                    unavailable[group] = str(inner)
+        if not events and last_error is not None:
+            return _dataset_quality_error(pixel_id, last_error)
+
+    event_list = sorted(events.values(), key=lambda ev: ev["event_name"])
+    if event_name:
+        event_list = [ev for ev in event_list if ev["event_name"].lower() == event_name.lower()]
+
+    issues: list[dict] = []
+    for ev in event_list:
+        ev["issues"] = _assess_event(ev)
+        issues.extend(ev["issues"])
+    severity_order = {SEVERITY_CRITICAL: 0, SEVERITY_HIGH: 1, SEVERITY_MEDIUM: 2, SEVERITY_LOW: 3, SEVERITY_INFO: 4}
+    issues.sort(key=lambda i: severity_order.get(i["severity"], 5))
+
+    scores = [
+        (ev["event_name"], ev["event_match_quality"]["composite_score"])
+        for ev in event_list
+        if isinstance((ev.get("event_match_quality") or {}).get("composite_score"), (int, float))
+    ]
+    response: dict[str, Any] = {
+        "pixel_id": pixel_id,
+        "event_count": len(event_list),
+        "lowest_match_quality": (
+            {"event": min(scores, key=lambda s: s[1])[0], "score": min(s[1] for s in scores)}
+            if scores else None
+        ),
+        "issue_count": len(issues),
+        "issues": issues,
+        "events": event_list,
+        "query_mode": mode,
+        "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
+    }
+    if unavailable:
+        response["unavailable_metrics"] = unavailable
+    if not event_list:
+        response["note"] = (
+            "Meta returned no quality data. EMQ needs Conversions API events (web) for this dataset; "
+            "pixel-only datasets, or datasets with no recent server events, return nothing."
+        )
+    return response
+
+
+def _dataset_quality_error(pixel_id: str, error: MetaAPIError) -> dict:
+    hint = (
+        "Dataset Quality needs a user/system user with 'Use events dataset' access on this pixel and an "
+        "app with ads_read plus ads_management or business_management. Client system user tokens are "
+        "not supported."
+    )
+    if error.error_code in (190, 102):
+        hint = "The access token is expired or invalid."
+    return {
+        "pixel_id": pixel_id,
+        "error": str(error),
+        "error_code": error.error_code,
+        "hint": hint,
+    }

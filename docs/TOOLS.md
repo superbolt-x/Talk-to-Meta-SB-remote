@@ -92,7 +92,7 @@ Get full creative spec with mode classification, media extraction, copy parsing,
 
 Returns: creative_mode, media (images/videos with URLs), copy (message/headline/CTA/link), identity (instagram_user_id vs deprecated instagram_actor_id).
 
-## Phase v1.1 Wave 4 - Tracking Diagnostics (5 tools)
+## Phase v1.1 Wave 4 - Tracking Diagnostics (6 tools)
 
 ### get_pixel_info [production-safe]
 Get pixel status, creation time, last fired time, and availability.
@@ -125,7 +125,16 @@ Run comprehensive tracking diagnostic for an ad account - checks all pixels, eve
 
 Returns aggregate health, all detected events, severity-ranked issues, and campaign-objective alignment warnings.
 
-## Phase v1.1 Wave 5 - Catalog & Connections (6 tools)
+### get_dataset_quality [production-safe]
+Get Meta's Dataset Quality for a pixel/dataset (web events): event match quality (0-10) with match-key coverage, Conversions API event coverage, dedupe-key coverage, additional conversions reported (ACR), data freshness, and Meta's own diagnostics. Flags weak events with severity-ranked issues and fixes.
+- `pixel_id` (str): Pixel / dataset ID (numeric).
+- `event_name` (str, optional): Only return this event (e.g. 'Purchase').
+- `agent_name` (str, optional): Only count events sent with this partner_agent. Normally unset.
+
+Needs a user/system user with "Use events dataset" access on the pixel (long-lived system user token recommended; client system user tokens are not supported). EMQ exists only for web events with Conversions API data - pixel-only datasets return nothing.
+Issue thresholds (EMQ < 6, event_id < 90% on browser/server events) are operator heuristics; the event coverage goal comes from Meta's response.
+
+## Phase v1.1 Wave 5 - Catalog & Connections (7 tools)
 
 ### get_catalog_info [production-safe]
 Get catalog details including product count, connected pixels, product sets, and feeds.
@@ -163,6 +172,27 @@ Update a product set name or filter rules.
 - `product_set_id` (str): Product set ID.
 - `name` (str, optional): New name.
 - `filter_rules` (dict, optional): New filter rules.
+
+### get_catalog_feed_health [production-safe]
+Check a catalog's feed health: recent upload sessions per feed (accepted vs invalid items, item-count drops against the previous upload, staleness against the feed schedule), a sample of the latest upload's errors and warnings (fatal first, with row numbers and retailer IDs), and Meta's catalog-level diagnostics (MUST_FIX vs OPPORTUNITY groups). Returns a health classification and severity-ranked issues.
+- `catalog_id` (str): Product catalog ID.
+- `feed_id` (str, optional): Only check this feed. Default: every feed on the catalog.
+- `upload_limit` (int, default 5, max 10): Recent upload sessions to inspect per feed.
+- `include_errors` (bool, default true): Include the error/warning sample for each feed's latest upload.
+- `include_diagnostics` (bool, default true): Include Meta's catalog diagnostic groups.
+
+Needs `catalog_management` and access to the catalog. Sections fail independently. Staleness is only checked for scheduled feeds (manual/API-fed catalogs have no expected cadence). Flag thresholds (invalid items >= 5% / 20%, item drop >= 20%, 2x missed schedule) are operator heuristics; error and diagnostic text comes from Meta. Generating Meta's full downloadable error report is a POST and is not exposed.
+
+## Phase v1.1 Wave 5b - Opportunity Score (1 tool)
+
+### get_opportunity_score [production-safe]
+Get Meta's opportunity score (0-100) for an ad account, Meta's recommendations ranked by the score points each would add, and optionally the daily score history. Read-only: recommendations are never applied by this tool.
+- `account_id` (str): Ad account ID.
+- `include_recommendations` (bool, default true): Include Meta's current recommendations.
+- `history_days` (int, default 0): Also return daily history for this many days (max 45; Meta lags ~2 days so it ends 2 days ago).
+- `explain_history` (bool, default false): With history, include the per-campaign changes that moved the score.
+
+Sections fail independently - a permissions error on recommendations still returns the score. The score is Meta's guidance, not a performance guarantee.
 
 ## Phase v1.1 Wave 6 - Audiences & Targeting (4 tools)
 

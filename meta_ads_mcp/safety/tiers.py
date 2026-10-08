@@ -78,7 +78,7 @@ def classify_action(
     Args:
         action_type: Type of action ('create', 'update', 'activate', 'pause', 'delete', 'archive').
         target_status: Current status of the target object ('ACTIVE', 'PAUSED').
-        current_budget: Current budget in currency units (e.g., EUR).
+        current_budget: Current budget in the account's currency units.
         proposed_budget: Proposed new budget in currency units.
         object_count: Number of objects affected (for bulk operations).
         is_creative_swap: Whether this is a creative replacement on active ad.
