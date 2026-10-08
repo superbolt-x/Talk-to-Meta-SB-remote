@@ -9,6 +9,7 @@ gaps, stale feeds, rejected products, and ecommerce readiness issues.
 
 Phase: v1.1 (Read) / v1.3 (Write)
 """
+import html
 import json
 import logging
 import re
@@ -681,14 +682,42 @@ def _safe_label(value: Any) -> Any:
     return value
 
 
+_HTML_BREAK = re.compile(r"<\s*(?:br\s*/?|/p|/li|/div)\s*>", re.IGNORECASE)
+_HTML_TAG = re.compile(r"<[^>]+>")
+_HREF = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+META_WEB_BASE = "https://business.facebook.com"
+
+
 def _clean_meta_text(text: Any) -> Any:
-    """Meta's diagnostic text occasionally ends in a stray closing brace from an unfilled template."""
+    """Plain text from Meta's diagnostic wording.
+
+    Meta sends HTML in some messages (<br />, <strong>, <a href=...>, &#039;) and occasionally a stray
+    closing brace from an unfilled template. Tags are removed, entities decoded, whitespace collapsed.
+    """
     if not isinstance(text, str):
         return text
-    text = text.strip()
+    text = _HTML_TAG.sub("", _HTML_BREAK.sub(" ", text))
+    text = " ".join(html.unescape(text).split())
     if text.endswith("}") and "{" not in text:
         text = text[:-1].rstrip()
     return text
+
+
+def _first_href(*texts: Any) -> Optional[str]:
+    """The first link inside any of the given (raw) texts, so a link Meta embedded in its wording is not lost."""
+    for text in texts:
+        if isinstance(text, str):
+            found = _HREF.search(text)
+            if found:
+                return html.unescape(found.group(1))
+    return None
+
+
+def _absolute_url(url: Any) -> Any:
+    """Meta sometimes returns a path ("/events_manager2/...") where a link is expected."""
+    if isinstance(url, str) and url.startswith("/") and not url.startswith("//"):
+        return META_WEB_BASE + url
+    return url
 
 
 def _schedule_interval_hours(schedule: Any) -> Optional[float]:
@@ -720,6 +749,16 @@ def _normalize_upload(raw: dict) -> dict:
         "warning_count": _int(raw.get("warning_count")),
         "invalid_ratio": round(invalid / detected, 4) if invalid is not None and detected else None,
     }
+
+
+def _upload_result(upload: dict) -> str:
+    """finished is not the same as succeeded: an upload can finish having read nothing because the feed login failed."""
+    if not upload["completed"]:
+        return "running"
+    errors = upload["error_count"] or 0
+    if errors and not upload["items_detected"]:
+        return "failed"
+    return "completed_with_errors" if errors else "ok"
 
 
 UPLOAD_FAILED_FIX = (
@@ -1241,36 +1280,64 @@ def _normalize_diagnostic_group(g: dict) -> dict:
         if not isinstance(d, dict):
             continue
         steps = d.get("instructions")
+        first_step = steps[0] if isinstance(steps, list) and steps else None
+        source = {"id": d.get("event_source_id"), "type": d.get("event_source_type"), "event": d.get("event_name")}
         nested.append({
             "type": d.get("type"),
-            "description": d.get("description"),
-            "details": d.get("details"),
-            "fix": d.get("call_to_action") or (steps[0] if isinstance(steps, list) and steps else None),
-            "fix_url": d.get("action_uri") or d.get("action_url"),
-            "event_source": {"id": d.get("event_source_id"), "type": d.get("event_source_type"),
-                             "event": d.get("event_name")},
+            "description": _clean_meta_text(d.get("description")),
+            "details": _clean_meta_text(d.get("details")),
+            "fix": _clean_meta_text(d.get("call_to_action") or first_step),
+            "fix_url": _absolute_url(d.get("action_uri") or d.get("action_url")
+                                     or _first_href(d.get("description"), d.get("details"), d.get("call_to_action"), first_step)),
+            "event_source": source if any(v is not None for v in source.values()) else None,
             "affected_items": _int(d.get("number_of_affected_items")),
         })
     return {
         "type": g.get("type"), "severity": g.get("severity"),
         "title": _clean_meta_text(g.get("title")), "subtitle": _clean_meta_text(g.get("subtitle")),
+        "fix_url": _first_href(g.get("title"), g.get("subtitle")),
         "affected_items": _int(g.get("number_of_affected_items")),
         "channels": g.get("affected_channels"), "issues": nested,
     }
 
 
+COMMERCE_MANAGER_CATALOGS = f"{META_WEB_BASE}/commerce/catalogs"
+GENERIC_CATALOG_FIX = "See Commerce Manager > Catalog > Diagnostics for the affected items."
+
+
+def _issue_severity(group_severity: Any, issue_type: Any) -> str:
+    """Meta's "must fix" blocks readiness, except an out-of-stock product: that is a normal stock state."""
+    if "OUT_OF_STOCK" in str(issue_type or "").upper():
+        return SEVERITY_LOW
+    return DIAG_SEVERITY.get(str(group_severity).upper(), SEVERITY_LOW)
+
+
+def _distinct_fix(fix: Any, message: str, *fallbacks: Any) -> Optional[str]:
+    """The first candidate that adds something beyond the message itself."""
+    for candidate in (fix, *fallbacks):
+        if candidate and str(candidate).strip().lower() != message.strip().lower():
+            return candidate
+    return None
+
+
 def _diagnostic_issues(group: dict) -> list[dict]:
-    severity = DIAG_SEVERITY.get(str(group.get("severity")).upper(), SEVERITY_LOW)
     if not group["issues"]:
-        return [{"severity": severity, "check": group.get("type"), "message": group.get("title") or group.get("type"),
-                 "fix": group.get("subtitle") or "See Commerce Manager > Catalog > Diagnostics.", "fix_url": None}]
+        message = group.get("title") or group.get("type") or "Catalog issue"
+        return [{"severity": _issue_severity(group.get("severity"), group.get("type")), "check": group.get("type"),
+                 "message": message,
+                 "fix": _distinct_fix(group.get("subtitle"), message) or GENERIC_CATALOG_FIX,
+                 "fix_url": group.get("fix_url") or COMMERCE_MANAGER_CATALOGS}]
     out = []
     for n in group["issues"]:
-        src = n["event_source"]
-        where = (f" ({src['event']} on {src['type'] or 'event source'} {src['id']})" if src.get("event") or src.get("id") else "")
-        out.append({"severity": severity, "check": n["type"] or group.get("type"),
-                    "message": f"{n['description'] or n['type']}{where}",
-                    "fix": n["fix"] or n["details"] or group.get("subtitle"), "fix_url": n["fix_url"]})
+        src = n["event_source"] or {}
+        where = f" ({src['event']} on {src['type'] or 'event source'} {src['id']})" if src.get("event") or src.get("id") else ""
+        message = f"{n['description'] or n['type']}{where}"
+        out.append({
+            "severity": _issue_severity(group.get("severity"), n["type"]),
+            "check": n["type"] or group.get("type"), "message": message,
+            "fix": _distinct_fix(n["fix"], message, n["details"], group.get("subtitle")) or GENERIC_CATALOG_FIX,
+            "fix_url": n["fix_url"] or group.get("fix_url") or COMMERCE_MANAGER_CATALOGS,
+        })
     return out
 
 
@@ -1351,8 +1418,11 @@ def get_catalog_readiness(catalog_id: str, connection_method: Optional[str] = No
         except MetaAPIError as e:
             notes.append(f"Pixel checks for {src.get('name') or src['id']} are not available: {e}")
             continue
-        checks = [{"key": c.get("key"), "title": c.get("title"), "result": str(c.get("result", "")).lower() or None,
-                   "explanation": c.get("user_message"), "fix_url": c.get("action_uri")}
+        checks = [{"key": c.get("key"), "title": _clean_meta_text(c.get("title")),
+                   "result": str(c.get("result", "")).lower() or None,
+                   "explanation": _clean_meta_text(c.get("user_message")),
+                   "description": _clean_meta_text(c.get("description")),
+                   "fix_url": _absolute_url(c.get("action_uri"))}
                   for c in res.get("data", []) if isinstance(c, dict)]
         pixel_checks.append({"pixel_id": src["id"], "name": src.get("name"), "checks": checks})
         for c in checks:
@@ -1360,7 +1430,8 @@ def get_catalog_readiness(catalog_id: str, connection_method: Optional[str] = No
                 issues.append({"severity": SEVERITY_HIGH, "check": c["key"],
                                "message": f"{src.get('name') or src['id']}: {c['title']}"
                                           + (f": {c['explanation']}" if c["explanation"] else ""),
-                               "fix": "Open the fix link for Meta's steps.", "fix_url": c["fix_url"]})
+                               "fix": c["description"] or "Open the fix link for Meta's steps.",
+                               "fix_url": c["fix_url"]})
     if pixel_checks:
         response["pixel_checks"] = pixel_checks
 
@@ -1418,7 +1489,9 @@ def get_catalog_data_sources(catalog_id: str) -> dict:
                                   reverse=True)
                 if sessions:
                     summary = {k: sessions[0][k] for k in ("start_time", "end_time", "completed", "input_method",
-                                                           "items_detected", "items_persisted", "items_invalid")}
+                                                           "items_detected", "items_persisted", "items_invalid",
+                                                           "error_count", "warning_count")}
+                    summary["result"] = _upload_result(sessions[0])
             except MetaAPIError:
                 pass
             if summary is None and isinstance(feed.get("latest_upload"), dict):
@@ -1517,7 +1590,13 @@ def get_feed_rules(
     reports = []
     for feed in feeds:
         fid = feed["id"]
-        report: dict[str, Any] = {"feed_id": fid, "name": _safe_label(feed.get("name"))}
+        name = feed.get("name")
+        if name is None:
+            try:
+                name = api_client.graph_get(f"/{fid}", fields=["id", "name"]).get("name")
+            except MetaAPIError:
+                pass
+        report: dict[str, Any] = {"feed_id": fid, "name": _safe_label(name)}
         try:
             res = _graph_with_fallback(f"/{fid}/rules", ["id", "attribute", "type", "params"], None)
             report["rules"] = [_normalize_rule(r) for r in res.get("data", []) if isinstance(r, dict)]

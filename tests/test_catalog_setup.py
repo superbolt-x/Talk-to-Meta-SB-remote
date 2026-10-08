@@ -213,7 +213,8 @@ class TestDataSources:
         assert feed["name"] == "Main feed" and feed["type"] == "PRIMARY_FEED" and feed["product_count"] == 120
         assert feed["latest_upload"] == {"start_time": "2026-10-08T04:00:00+0000", "end_time": "2026-10-08T04:01:00+0000",
                                          "completed": True, "input_method": "Server Fetch",
-                                         "items_detected": 120, "items_persisted": 118, "items_invalid": 2}
+                                         "items_detected": 120, "items_persisted": 118, "items_invalid": 2,
+                                         "error_count": None, "warning_count": None, "result": "ok"}
         assert out["event_sources"] == [{"id": "p1", "name": "Shop pixel", "type": "PIXEL"}]
         assert out["summary"] == {"feeds": 1, "event_sources": 1}
         assert out["catalog"]["name"] == "Shop catalog" and "notes" not in out
@@ -275,6 +276,116 @@ class TestDataSources:
         assert out["event_sources"] == [{"id": "p1", "name": "Shop pixel", "type": None}]
 
 
+class TestUploadResult:
+    """Seen live: Ettika's May 22 upload read `completed: true` with 0/0/0 items, but it had failed
+    with a feed login error. Finished is not the same as succeeded."""
+
+    def result_for(self, monkeypatch, **fields):
+        upload = {**UPLOAD_SESSION, **fields}
+        return sources_tool(monkeypatch, [FEED], uploads={"data": [upload]})["feeds"][0]["latest_upload"]
+
+    def test_a_finished_upload_that_read_nothing_because_of_errors_is_failed(self, monkeypatch):
+        latest = self.result_for(monkeypatch, num_detected_items=0, num_persisted_items=0, num_invalid_items=0, error_count=1)
+        assert latest["completed"] is True and latest["result"] == "failed" and latest["error_count"] == 1
+
+    def test_a_clean_upload_is_ok(self, monkeypatch):
+        assert self.result_for(monkeypatch, error_count=0, warning_count=0)["result"] == "ok"
+
+    def test_an_upload_with_some_errors_but_items_read_is_completed_with_errors(self, monkeypatch):
+        assert self.result_for(monkeypatch, error_count=4, warning_count=2)["result"] == "completed_with_errors"
+
+    def test_an_unfinished_upload_is_running(self, monkeypatch):
+        assert self.result_for(monkeypatch, end_time=None)["result"] == "running"
+
+
+class TestMetaTextCleanup:
+    def test_tags_entities_and_whitespace(self):
+        from meta_ads_mcp.core.catalogs import _clean_meta_text
+        raw = "<strong>5 items</strong> aren&#039;t shown<br />on mobile.\n\n<a href=\"https://x.example/h\">Learn   more</a>"
+        assert _clean_meta_text(raw) == "5 items aren't shown on mobile. Learn more"
+
+    def test_escaped_markup_stays_text_and_ordinary_text_is_untouched(self):
+        from meta_ads_mcp.core.catalogs import _clean_meta_text
+        assert _clean_meta_text("a &lt;b&gt; c") == "a <b> c"
+        assert _clean_meta_text("Plain sentence.") == "Plain sentence."
+        assert _clean_meta_text(None) is None
+
+    def test_the_stray_brace_is_still_removed_but_balanced_braces_are_kept(self):
+        from meta_ads_mcp.core.catalogs import _clean_meta_text
+        assert _clean_meta_text("Add the fields }") == "Add the fields"
+        assert _clean_meta_text("Keep {placeholder}") == "Keep {placeholder}"
+
+    def test_relative_links_become_absolute_and_others_are_untouched(self):
+        from meta_ads_mcp.core.catalogs import _absolute_url
+        assert _absolute_url("/events_manager2/list/pixel/1/overview") == "https://business.facebook.com/events_manager2/list/pixel/1/overview"
+        assert _absolute_url("https://adsmanager.facebook.com/x") == "https://adsmanager.facebook.com/x"
+        assert _absolute_url("//cdn.example/x") == "//cdn.example/x" and _absolute_url(None) is None
+
+    def test_a_link_embedded_in_the_wording_is_found(self):
+        from meta_ads_mcp.core.catalogs import _first_href
+        assert _first_href("none", 'See <a href="https://x.example/a?b=1&amp;c=2">this</a>') == "https://x.example/a?b=1&c=2"
+        assert _first_href("no link here", None) is None
+
+
+class TestReadinessWording:
+    """Seen live on Ettika and Seed: raw markup in messages, out-of-stock counted as blocking, relative
+    links, and fix text that repeated the message."""
+
+    def group(self, **over):
+        base = {"type": "PRODUCT_ISSUES", "severity": "MUST_FIX", "title": "Items are not shown", "number_of_affected_items": 5,
+                "subtitle": "Fix these items.", "diagnostics": []}
+        return {**base, **over}
+
+    def test_markup_and_entities_are_removed_from_every_text_field(self, monkeypatch):
+        nested = {"type": "image_fetch_failed", "description": "<strong>5 items</strong> couldn&#039;t load images<br />on the site",
+                  "details": "Check the <a href=\"https://help.example/images\">image guide</a>.", "call_to_action": "Fix the image URLs",
+                  "number_of_affected_items": 5}
+        out, _ = readiness(monkeypatch, es=[self.group(title="Your catalog isn&#039;t healthy", diagnostics=[nested])])
+        issue = out["issues"][0]
+        assert issue["message"] == "5 items couldn't load images on the site"
+        assert issue["fix"] == "Fix the image URLs"
+        assert issue["fix_url"] == "https://help.example/images"  # the link inside the wording is kept
+        assert out["event_source_issues"][0]["title"] == "Your catalog isn't healthy"
+        assert "<" not in str(out["issues"]) and "&#" not in str(out)
+
+    def test_an_out_of_stock_product_is_not_blocking(self, monkeypatch):
+        stock = {"type": "PRODUCT_OUT_OF_STOCK", "description": "1 item is out of stock", "number_of_affected_items": 1}
+        out, _ = readiness(monkeypatch, da=[self.group(diagnostics=[stock])])
+        assert out["issues"][0]["severity"] == "LOW"
+        assert out["status"] == "ready" and out["summary"]["blocking_issues"] == 0
+
+    def test_other_must_fix_issues_in_the_same_group_still_block(self, monkeypatch):
+        stock = {"type": "PRODUCT_OUT_OF_STOCK", "description": "1 item is out of stock"}
+        images = {"type": "image_fetch_failed", "description": "5 items have images that cannot be fetched"}
+        out, _ = readiness(monkeypatch, da=[self.group(diagnostics=[stock, images])])
+        severities = {i["check"]: i["severity"] for i in out["issues"]}
+        assert severities == {"image_fetch_failed": "HIGH", "PRODUCT_OUT_OF_STOCK": "LOW"}
+        assert out["status"] == "not_ready" and out["summary"]["blocking_issues"] == 1
+
+    def test_fix_text_that_only_repeats_the_message_is_replaced_by_a_pointer(self, monkeypatch):
+        repeated = self.group(title="Items are not shown", subtitle="Items are not shown")
+        out, _ = readiness(monkeypatch, da=[repeated])
+        issue = out["issues"][0]
+        assert issue["fix"] == "See Commerce Manager > Catalog > Diagnostics for the affected items."
+        assert issue["fix_url"] == "https://business.facebook.com/commerce/catalogs"
+
+    def test_an_event_source_made_only_of_nulls_is_left_out(self, monkeypatch):
+        nested = {"type": "image_fetch_failed", "description": "5 items", "event_source_id": None, "event_source_type": None}
+        out, _ = readiness(monkeypatch, da=[self.group(diagnostics=[nested])])
+        assert out["dynamic_ads_issues"][0]["issues"][0]["event_source"] is None
+        assert out["issues"][0]["message"] == "5 items"  # no empty "(... on event source None)"
+
+    def test_a_failed_pixel_check_uses_metas_description_as_the_guidance_and_a_full_link(self, monkeypatch):
+        failing = {"key": "pixel_has_low_event_source_match_rate", "title": "Low match rate", "result": "failed",
+                   "description": "Fewer than half of your events match products in the catalog.",
+                   "action_uri": "/events_manager2/list/pixel/p1/overview"}
+        out, _ = readiness(monkeypatch, pixel={"data": [failing]})
+        issue = out["issues"][0]
+        assert issue["message"] == "Shop pixel: Low match rate"
+        assert issue["fix"] == "Fewer than half of your events match products in the catalog."
+        assert issue["fix_url"] == "https://business.facebook.com/events_manager2/list/pixel/p1/overview"
+
+
 # ============================================================ get_feed_rules
 
 RULES = {"data": [
@@ -294,7 +405,7 @@ UPLOADS = {"data": [{"id": "u_run", "start_time": "2026-10-08T11:00:00+0000"},
 
 def rules_tool(monkeypatch, extra=None, **kw):
     from meta_ads_mcp.core.catalogs import get_feed_rules
-    routes = {"/f1/rules": RULES, "/f1/uploads": UPLOADS, "/u_done/errors": ERRORS,
+    routes = {"/f1": {"id": "f1", "name": "Main feed"}, "/f1/rules": RULES, "/f1/uploads": UPLOADS, "/u_done/errors": ERRORS,
               "/e2/suggested_rules": SUGGESTION, "/e3/suggested_rules": {"data": []}, "/e1/suggested_rules": SUGGESTION}
     routes.update(extra or {})
     calls = install(monkeypatch, routes)
@@ -388,6 +499,29 @@ class TestFeedRules:
         from meta_ads_mcp.core.catalogs import get_feed_rules
         assert get_feed_rules()["blocked_at"] == "input_validation"
         assert get_feed_rules(feed_id="f1", catalog_id="cat1")["blocked_at"] == "input_validation"
+
+
+class TestFeedRuleNames:
+    """Seen live: `name` was null when called with only a feed_id."""
+
+    def test_the_name_is_looked_up_when_only_a_feed_id_is_given(self, monkeypatch):
+        out, calls = rules_tool(monkeypatch, include_suggestions=False)
+        assert out["feeds"][0]["name"] == "Main feed"
+        assert any(c["endpoint"] == "/f1" for c in calls)
+
+    def test_a_failed_name_lookup_is_not_an_error(self, monkeypatch):
+        out, _ = rules_tool(monkeypatch, {"/f1": MetaAPIError("(#200) denied", error_code=200)}, include_suggestions=False)
+        assert out["feeds"][0]["name"] is None and "errors" not in out
+
+    def test_catalog_mode_does_not_repeat_the_lookup(self, monkeypatch):
+        extra = {"/cat1/product_feeds": {"data": [{"id": "f1", "name": "Named"}]}}
+        out, calls = rules_tool(monkeypatch, extra, feed_id=None, catalog_id="cat1", include_suggestions=False)
+        assert out["feeds"][0]["name"] == "Named" and not any(c["endpoint"] == "/f1" for c in calls)
+
+    def test_a_url_shaped_name_still_shows_only_the_host(self, monkeypatch):
+        out, _ = rules_tool(monkeypatch, {"/f1": {"id": "f1", "name": "https://u:p@shop.example.com/feed.csv"}},
+                            include_suggestions=False)
+        assert out["feeds"][0]["name"] == "shop.example.com"
 
 
 def test_all_three_are_registered_as_read_only_tools():
