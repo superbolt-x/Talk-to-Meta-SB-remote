@@ -329,8 +329,8 @@ def _annotate_group(metrics: dict, level: Optional[float]) -> None:
 def _lift_row(raw: Any, cell_names: dict[str, str], level: Optional[float]) -> Optional[dict]:
     """One lift result (a JSON string per cell) grouped by the first word of each metric, whether Meta separates
     it with an underscore or a dot: population_test -> population.test, scoreSum.incremental -> scoreSum.incremental.
-    Metrics Meta left empty are dropped; a row with only who was in the test (population) and delivery figures
-    says `has_results: false`."""
+    Metrics Meta left empty are dropped; a row with only who was in the test (population), delivery figures and
+    IDs says `has_results: false`."""
     try:
         data = json.loads(raw) if isinstance(raw, str) else raw
     except ValueError:
@@ -352,14 +352,22 @@ def _lift_row(raw: Any, cell_names: dict[str, str], level: Optional[float]) -> O
     kept: dict[str, dict] = {}
     for name, metrics in groups.items():
         metrics = {k: v for k, v in metrics.items() if v is not None}
+        if name == "objective" and set(metrics) <= {"id"}:
+            continue  # the objective's own ID, repeated on each of its rows: the row sits under that objective already
         if metrics:
             _annotate_group(metrics, level)
             kept[name] = metrics
     row: dict[str, Any] = {"cell_id": cell_id, "cell_name": cell_names.get(cell_id or "")}
     row.update({k: v for k, v in top.items() if v is not None})
-    row["has_results"] = any(name not in CONTEXT_GROUPS for name in kept)
+    row["has_results"] = any(_is_outcome(name, metrics) for name, metrics in kept.items())
     row.update(kept)
     return row
+
+
+def _is_outcome(name: str, metrics: dict) -> bool:
+    """Whether a group holds something the study found. Who was in the test (population) and a group made only of
+    IDs (experiment.id) say nothing about the outcome."""
+    return name not in CONTEXT_GROUPS and any(not _ID_KEY.search(key) for key in metrics)
 
 
 def _hoist_shared(rows: list[dict]) -> dict:
