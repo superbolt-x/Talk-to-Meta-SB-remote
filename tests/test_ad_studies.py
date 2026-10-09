@@ -123,7 +123,18 @@ class TestList:
         install(monkeypatch, {"/act_1/ad_studies": {"data": self.ROWS}})
         out = run_list(limit=2)
         assert [s["id"] for s in out["studies"]] == ["2", "3"] and out["total"] == 4
-        assert "newest 2 of 4" in out["studies_note"]
+        assert out["truncated"] is True and "newest 2 of 4 found" in out["truncation_note"] and "cover all 4" in out["truncation_note"]
+
+    def test_a_list_that_fits_is_not_flagged(self, monkeypatch):
+        install(monkeypatch, {"/act_1/ad_studies": {"data": self.ROWS}})
+        assert run_list(limit=4)["truncated"] is False
+
+    def test_a_recurring_lift_config_is_not_counted_as_a_running_study(self, monkeypatch):
+        install(monkeypatch, {"/act_1/ad_studies": {"data": [
+            study("7", "Always on", "CONTINUOUS_LIFT_CONFIG", "2026-01-01T00:00:00+0000", "2027-01-01T00:00:00+0000")]}})
+        out = run_list()
+        assert out["studies"][0]["status"] == "recurring_config" and out["summary"]["by_status"] == {"recurring_config": 1}
+        assert run_list(status="running")["total"] == 0
 
     def test_nothing_found_says_so(self, monkeypatch):
         install(monkeypatch, {"/act_1/ad_studies": {"data": []}})
@@ -199,6 +210,7 @@ class TestLift:
             "/900/cells": {"data": [{"id": "c1", "name": "Test group", "treatment_percentage": 90, "control_percentage": 10}]},
             "/900/objectives": {"data": [{"id": "o1", "name": "Purchases", "type": "CONVERSIONS", "is_primary": True}]},
             "/o1": {"results": results, "last_updated_results": "2026-10-07"},
+            "/c1/ad_accounts": {"data": [{"id": "act_7", "currency": "USD"}]},
         }
 
     def test_results_are_grouped_by_what_they_measure_with_the_cell_named(self, monkeypatch):
@@ -212,8 +224,9 @@ class TestLift:
         assert row["cell_id"] == "c1" and row["cell_name"] == "Test group" and row["spend"] == 26059 and row["impressions"] == 19020874
         assert row["population"] == {"test": 2334212, "control": 123407, "reached": 1862084}
         conv = row["conversions"]
-        assert conv["incremental"] == -162.92 and conv["incremental_lower"] == -3470.63 and conv["incremental_upper"] == 3235.06
-        assert conv["confidence"] == 0.6929 and conv["CPiC"] == -159.95 and conv["multicell_rank"] is None
+        assert conv["incremental"] == -162.92 and conv["CPiC"] is None and conv["range_includes_zero"] is True and conv["incremental_lower"] == -3470.63 and conv["incremental_upper"] == 3235.06
+        assert conv["confidence"] == 0.6929 and "multicell_rank" not in conv  # Meta's empty metrics are dropped
+        assert row["has_results"] is True
         obj_call = next(c for c in calls if c["endpoint"] == "/o1")
         assert obj_call["params"]["breakdowns"] == '["cell_id"]' and "results" in obj_call["fields"]
 
@@ -249,6 +262,212 @@ class TestLift:
         install(monkeypatch, routes)
         out = run_get()
         assert "denied" in out["objectives"][0]["error"] and out["cells"][0]["id"] == "c1"
+
+
+class TestLiftReal:
+    """Shapes and oddities seen on real Erie and Seed studies."""
+
+    def routes(self, results, objectives=None, study_over=None, **extra):
+        study_over = study_over or {}
+        base = {
+            "/900": study("900", "Power lift", "LIFT", **study_over),
+            "/900/cells": {"data": [{"id": "c1", "name": "Test group", "treatment_percentage": 92, "control_percentage": 8}]},
+            "/900/objectives": {"data": objectives or [{"id": "o1", "name": "Set", "type": "CONVERSIONS", "is_primary": True}]},
+            "/o1": {"results": results, "last_updated_results": "2026-10-05"},
+            "/c1/ad_accounts": {"data": [{"id": "act_7", "currency": "USD"}]},
+        }
+        base.update(extra)
+        return base
+
+    def test_a_result_with_every_metric_empty_says_so_instead_of_blocks_of_nulls(self, monkeypatch):
+        empty = json.dumps({"cell_id": "c1", **{f"conversions_{k}": None for k in ("test", "incremental", "confidence")},
+                            **{f"sales_{k}": None for k in ("test", "incremental")}})
+        install(monkeypatch, self.routes([empty]))
+        obj = run_get()["objectives"][0]
+        assert obj["results"] == [{"cell_id": "c1", "cell_name": "Test group", "has_results": False}]
+        assert obj["has_results"] is False and "no values, and does not say why" in obj["note"]
+
+    def test_spend_and_impressions_survive_when_the_rest_is_empty(self, monkeypatch):
+        row = json.dumps({"cell_id": "c1", "spend": 1200, "impressions": 5000, "conversions_incremental": None})
+        install(monkeypatch, self.routes([row]))
+        r = run_get()["objectives"][0]["results"][0]
+        assert r["spend"] == 1200 and r["impressions"] == 5000 and r["has_results"] is False and "conversions" not in r
+
+    def test_a_group_that_still_has_values_keeps_only_those(self, monkeypatch):
+        row = json.dumps({"cell_id": "c1", "conversions_incremental": 5.0, "conversions_test": None, "sales_incremental": None})
+        install(monkeypatch, self.routes([row]))
+        r = run_get()["objectives"][0]["results"][0]
+        assert r["conversions"] == {"incremental": 5.0} and "sales" not in r and r["has_results"] is True
+
+    def test_brand_results_with_dotted_keys_are_grouped_like_the_rest(self, monkeypatch):
+        rows = [json.dumps({"cell_id": "c1", "population.test": 1000, "population.control": 100, "scoreSum.incremental": 0.5,
+                            "isWinner.is": True, "experiment.id": f"e{i}", "topNAdsId": [120216000000000001, 120216000000000002]})
+                for i in (1, 2, 3)]
+        install(monkeypatch, self.routes(rows, objectives=[{"id": "o1", "name": "BLS", "type": "BRAND", "is_primary": False}]))
+        obj = run_get()["objectives"][0]
+        first = obj["results"][0]
+        assert first["population"] == {"test": 1000, "control": 100} and first["scoreSum"] == {"incremental": 0.5}
+        assert first["isWinner"] == {"is": True}
+        assert [r["experiment"]["id"] for r in obj["results"]] == ["e1", "e2", "e3"]  # the rows are told apart
+
+    def test_a_list_repeated_on_every_row_is_moved_out_once_and_ids_stay_whole(self, monkeypatch):
+        rows = [json.dumps({"cell_id": "c1", "experiment.id": f"e{i}", "topNAdsId": [120216000000000001, 7]}) for i in (1, 2)]
+        install(monkeypatch, self.routes(rows))
+        obj = run_get()["objectives"][0]
+        assert obj["shared"] == {"topNAdsId": ["120216000000000001", 7]}  # whole numbers too big for JSON clients become text
+        assert all("topNAdsId" not in r for r in obj["results"])
+
+    def test_a_list_on_a_single_row_stays_where_it_is(self, monkeypatch):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "conversions_incremental": 3.0, "topNAdsId": [1, 2]})]))
+        obj = run_get()["objectives"][0]
+        assert obj["results"][0]["topNAdsId"] == [1, 2] and "shared" not in obj
+
+    def test_rows_that_differ_are_not_hoisted(self, monkeypatch):
+        rows = [json.dumps({"cell_id": "c1", "topNAdsId": [i, 2]}) for i in (1, 3)]
+        install(monkeypatch, self.routes(rows))
+        obj = run_get()["objectives"][0]
+        assert "shared" not in obj and obj["results"][0]["topNAdsId"] == [1, 2]
+
+    @pytest.mark.parametrize("value,expected", [
+        (120216000000000001, "120216000000000001"), (999999999999999, 999999999999999), (19020874, 19020874),
+        (0.123456789, 0.1235), (1234.5678, 1234.57), (True, True), (None, None), ("x", "x"), ([1.5555, 10 ** 16], [1.56, str(10 ** 16)])])
+    def test_numbers_are_rounded_and_giant_ones_become_text(self, value, expected):
+        assert studies._round(value) == expected
+
+    def test_a_cost_per_incremental_result_is_blanked_when_nothing_incremental_was_found(self, monkeypatch):
+        row = json.dumps({"cell_id": "c1", "conversions_incremental": -87, "conversions_CPiC": -11136.94, "conversions_confidence": 0.14,
+                          "conversions_incremental_lower": -300, "conversions_incremental_upper": 100})
+        install(monkeypatch, self.routes([row]))
+        conv = run_get()["objectives"][0]["results"][0]["conversions"]
+        assert conv["CPiC"] is None and "not meaningful" in conv["cost_per_incremental_note"] and conv["confidence"] == 0.14
+
+    def test_a_positive_result_keeps_its_cost_and_says_whether_its_range_spans_zero(self, monkeypatch):
+        spans = json.dumps({"cell_id": "c1", "conversions_incremental": 50, "conversions_CPiC": 17616.62,
+                            "conversions_incremental_lower": -31, "conversions_incremental_upper": 140})
+        clear = json.dumps({"cell_id": "c1", "conversions_incremental": 50, "conversions_CPiC": 400.0,
+                            "conversions_incremental_lower": 20, "conversions_incremental_upper": 80})
+        install(monkeypatch, self.routes([spans, clear]))
+        a, b = (r["conversions"] for r in run_get()["objectives"][0]["results"])
+        assert a["CPiC"] == 17616.62 and a["range_includes_zero"] is True and "cost_per_incremental_note" not in a
+        assert b["CPiC"] == 400.0 and b["range_includes_zero"] is False
+
+    def test_buyers_costs_are_blanked_the_same_way(self, monkeypatch):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "buyers_incremental": 0, "buyers_CPiB": 55.0})]))
+        assert run_get()["objectives"][0]["results"][0]["buyers"]["CPiB"] is None
+
+    def test_no_range_means_no_claim_about_it(self, monkeypatch):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "conversions_incremental": 5, "conversions_incremental_lower": 1})]))
+        assert "range_includes_zero" not in run_get()["objectives"][0]["results"][0]["conversions"]
+
+    def test_every_objective_is_read_up_to_the_limit_primary_first(self, monkeypatch):
+        objectives = [{"id": f"o{i}", "name": f"Obj {i}", "type": "CONVERSIONS", "is_primary": i == 3} for i in range(1, 6)]
+        routes = self.routes([], objectives=objectives)
+        for i in range(1, 6):
+            routes[f"/o{i}"] = {"results": [json.dumps({"cell_id": "c1", "conversions_incremental": float(i)})]}
+        calls = install(monkeypatch, routes)
+        out = run_get(max_objectives=2)
+        assert [o["name"] for o in out["objectives"][:2]] == ["Obj 3", "Obj 1"]
+        assert [o.get("results_read") for o in out["objectives"][2:]] == [False, False, False]
+        assert sorted(c["endpoint"] for c in calls if c["endpoint"] in {f"/o{i}" for i in range(1, 6)}) == ["/o1", "/o3"]
+        assert "first 2 of 5 objectives" in out["notes"][0] and "max_objectives" in out["notes"][0]
+
+    def test_twenty_two_objectives_are_all_read_by_default(self, monkeypatch):
+        objectives = [{"id": f"o{i}", "name": f"Obj {i}", "type": "CONVERSIONS", "is_primary": False} for i in range(22)]
+        routes = self.routes([], objectives=objectives)
+        for i in range(22):
+            routes[f"/o{i}"] = {"results": []}
+        install(monkeypatch, routes)
+        out = run_get()
+        assert len(out["objectives"]) == 22 and all("results_read" not in o for o in out["objectives"]) and "notes" not in out
+
+    @pytest.mark.parametrize("n", [0, 51, -1])
+    def test_max_objectives_is_validated(self, n):
+        assert run_get(max_objectives=n)["blocked_at"] == "input_validation"
+
+    def test_a_running_study_is_marked_interim(self, monkeypatch):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "conversions_incremental": 1.0})],
+                                         study_over={"start_time": "2026-10-01T00:00:00+0000", "end_time": "2026-10-30T00:00:00+0000"}))
+        out = run_get()
+        assert out["results_status"] == "interim" and any("interim" in n for n in out["notes"])
+
+    def test_a_finished_study_is_final(self, monkeypatch):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "conversions_incremental": 1.0})]))
+        out = run_get()
+        assert out["results_status"] == "final" and not any("interim" in n for n in out.get("notes", []))
+
+    def test_spend_is_labelled_with_the_account_currency_and_confidence_is_explained(self, monkeypatch):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})]))
+        assert run_get()["units"] == {"spend": "USD", "confidence": "a fraction between 0 and 1"}
+
+    @pytest.mark.parametrize("accounts", [
+        {"data": [{"id": "a", "currency": "USD"}, {"id": "b", "currency": "EUR"}]},
+        {"data": []},
+        MetaAPIError("(#200) denied", error_code=200),
+    ])
+    def test_a_currency_that_cannot_be_determined_is_not_guessed(self, monkeypatch, accounts):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{"/c1/ad_accounts": accounts}))
+        assert "not determined" in run_get()["units"]["spend"]
+
+    def test_include_results_false_has_no_units_status_or_currency_call(self, monkeypatch):
+        calls = install(monkeypatch, self.routes([]))
+        out = run_get(include_results=False)
+        assert "units" not in out and "results_status" not in out and not any(c["endpoint"].endswith("ad_accounts") for c in calls)
+
+
+class TestHeaderFields:
+    """One field Meta will not return used to cost the study every optional field, including its dates."""
+
+    def test_only_the_field_meta_names_is_dropped(self, monkeypatch):
+        seen = []
+
+        def node(params, fields):
+            seen.append(list(fields))
+            if "confidence_level" in fields:
+                return MetaAPIError("(#100) Tried accessing nonexisting field (confidence_level) on node type (AdStudy)", error_code=100)
+            return study("900", "S", "VERSION_CONTROL", results_first_available_date="2026-09-20", observation_end_time="2026-10-20T00:00:00+0000")
+
+        install(monkeypatch, {"/900": node, "/900/cells": {"data": []}, "/900/objectives": {"data": []}})
+        out = run_get()
+        assert len(seen) == 2 and set(seen[0]) - set(seen[1]) == {"confidence_level"}
+        assert out["study"]["results_first_available"] == "2026-09-20" and out["study"]["observation_end"] is not None
+        assert out["study"]["confidence_level"] is None and "would not return confidence_level" in out["notes"][0]
+
+    def test_a_rejection_that_names_nothing_falls_back_to_the_basic_set(self, monkeypatch):
+        seen = []
+
+        def node(params, fields):
+            seen.append(list(fields))
+            return MetaAPIError("(#100) Invalid parameter", error_code=100) if len(fields) > len(studies.STUDY_FIELDS_BASIC) else study("900", "S", "VERSION_CONTROL")
+
+        install(monkeypatch, {"/900": node, "/900/cells": {"data": []}, "/900/objectives": {"data": []}})
+        out = run_get()
+        assert seen[-1] == studies.STUDY_FIELDS_BASIC and "would not return" in out["notes"][0] and "confidence_level" in out["notes"][0]
+
+    def test_several_rejected_fields_are_dropped_one_after_another(self, monkeypatch):
+        bad = {"confidence_level", "canceled_time"}
+
+        def node(params, fields):
+            hit = next((f for f in fields if f in bad), None)
+            return MetaAPIError(f"(#100) nonexisting field ({hit})", error_code=100) if hit else study("900", "S", "VERSION_CONTROL")
+
+        install(monkeypatch, {"/900": node, "/900/cells": {"data": []}, "/900/objectives": {"data": []}})
+        out = run_get()
+        assert "canceled_time" in out["notes"][0] and "confidence_level" in out["notes"][0] and "error" not in out
+
+    def test_a_non_100_error_is_not_retried(self, monkeypatch):
+        calls = install(monkeypatch, {"/900": MetaAPIError("(#200) denied", error_code=200)})
+        assert run_get()["error_code"] == 200 and len(calls) == 1
+
+    def test_the_list_drops_only_the_rejected_field_too(self, monkeypatch):
+        seen = []
+
+        def handler(p, fields):
+            seen.append(list(fields))
+            return MetaAPIError("(#100) nonexisting field (confidence_level)", error_code=100) if "confidence_level" in fields else {"data": [study("1", observation_end_time="2026-10-20T00:00:00+0000")]}
+
+        install(monkeypatch, {"/act_1/ad_studies": handler})
+        out = run_list()
+        assert "observation_end_time" in seen[1] and out["studies"][0]["observation_end"] is not None
 
 
 class TestSplit:
