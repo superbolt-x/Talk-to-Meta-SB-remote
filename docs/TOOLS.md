@@ -276,8 +276,9 @@ Change history for an ad account: who changed what, and when (budget, status, bi
 - `object_id` (str, optional): only events for this campaign / ad set / ad. Sent to Meta as the account history's `oid` filter (Meta has a per-object activities edge only for ad sets) and checked again here, so it combines with `category`, `user_id` and `event_type`. If Meta does not apply it, the account history is scanned up to a read limit (1,000 events per window) and the response says how far back that reached.
 - `event_type` (str, optional): only event types containing this text (e.g. 'budget', 'run_status', 'review'). Applied here, so the tool reads further pages (up to 1,000 raw events) to find enough matches.
 - `limit` (int, default 100, max 500).
+- `include_status_blips` (bool, default false): also list status round trips that ended where they began (Active, Pending Process, Active). They are hidden by default, do not count against `limit`, and are counted in `summary.no_net_change_hidden`.
 
-Each event has `time`, `local_time` (account timezone), `actor`, `via` (the app used), `what`, `object` (with `kind`) and, when Meta supplies old and new values, `change` (`from` / `to` / `currency` / `change_pct`). Budget and billing amounts are converted from the currency's smallest unit to major units (assuming 2 decimals; zero-decimal currencies are not handled). A pause or activation, which Meta records as a burst of events (Active to Pending Process, a `..._to_be_set_after_review` note, Pending Process to Inactive, sometimes with other objects' events in between), is shown as one event with `merged_events`; a burst that ends in the state it began in has `change: null` and a `note` saying there was no net change. `summary` counts events by type and by person. `window.searched_back_to` is how far back the history was actually read (anything older was not looked at), `window.events_reach_back_to` is the oldest event returned, and `window.events_read` is how many raw events were read. A list cut off at `limit` is flagged `truncated`, with a note on how to narrow it. If a read stopped at its limit before the start of the window, a note says so and the older windows are not read (no gap in the middle); `truncated` is then about the read limit, not `limit`.
+Each event has `time`, `local_time` (account timezone), `actor`, `via` (the app used), `what`, `object` (with `kind`) and, when Meta supplies old and new values, `change` (`from` / `to` / `currency` / `change_pct`). Budget and billing amounts are converted from the currency's smallest unit to major units (assuming 2 decimals; zero-decimal currencies are not handled). A pause or activation, which Meta records as a burst of events (Active to Pending Process, a `..._to_be_set_after_review` note, Pending Process to Inactive, sometimes with other objects' events in between), is shown as one event with `merged_events`; a burst that ends in the state it began in has `change: null`, `no_net_change: true` and a `note` (hidden by default, see `include_status_blips`). `summary` counts events by type and by person. `window.searched_back_to` is how far back the history was actually read (anything older was not looked at), `window.events_reach_back_to` is the oldest event returned, and `window.events_read` is how many raw events were read. A list cut off at `limit` is flagged `truncated`, with a note on how to narrow it. If a read stopped at its limit before the start of the window, a note says so and the older windows are not read (no gap in the middle); `truncated` is then about the read limit, not `limit`.
 
 If Meta's service fails the error comes with a plain-language hint: codes 1 and 2 mean the service failed or the window was too large; permission codes point to `ads_read` and the token.
 
@@ -291,6 +292,35 @@ Campaigns, ad sets and ads Meta has flagged as not delivering properly: effectiv
 - `max_entities` (int, default 5, max 1000, 0 for none): entities listed per level, most recently updated first. The summary and reasons always cover every flagged entity.
 
 The answer leads with `scope` (`{"type": "account"|"campaign", "id": ...}`), `total`, `summary` (counts by level and status) and `reasons`: one entry per distinct problem with how many entities have it (counted once per entity), the levels, and three examples. Ad review feedback, which Meta repeats under `global` and every placement, is folded into `review_reasons` (policy, text, placements) and also counts as a `Review: <policy>` reason. `entities_note` says when the list was cut to `max_entities`. Up to 300 entities per level are read; a longer list is flagged `truncated`. A level that errors is reported under `errors` and never counted as clean.
+
+## Phase v1.1 Wave 5d - Previews & Experiment Results (3 tools)
+
+### get_ad_previews [production-safe]
+Links to see how an ad looks in each placement (feed, Instagram, stories, Reels...). Meta answers with an HTML iframe; the tool unpacks it into a plain link with its size. The links are Meta-signed and expire (Meta documents about 24 hours), so open them now rather than saving them.
+- `ad_id` (str) or `creative_id` (str): give exactly one.
+- `ad_formats` (str, default `DESKTOP_FEED_STANDARD,MOBILE_FEED_STANDARD,INSTAGRAM_STANDARD`): comma-separated placements, up to 6 (also e.g. `INSTAGRAM_STORY`, `INSTAGRAM_REELS`, `FACEBOOK_STORY_MOBILE`, `FACEBOOK_REELS_MOBILE`, `RIGHT_COLUMN_STANDARD`).
+- `locale` (str, optional): such as `en_US`.
+
+One request per format. A format Meta cannot build for the ad (for example a Reels format for an image ad) is reported under `errors` and does not hide the others.
+
+### list_ad_studies [production-safe]
+A/B tests (split tests) and conversion lift studies, newest first. Meta stores both as "ad studies".
+- `account_id` (str) or `business_id` (str): give exactly one. An account is read from its own `ad_studies` edge; if Meta has none, the owning business is read and a note says so.
+- `study_type` (str, optional): contains-match, case-insensitive: `SPLIT` (split tests), `LIFT` (lift and geo lift), or an exact type such as `SPLIT_TEST_V2`.
+- `status` (str, optional): `scheduled`, `running`, `observation`, `completed` or `canceled`. Meta has no status field on a study, so it is worked out from the dates.
+- `limit` (int, default 25, max 100).
+
+Up to 500 studies are read; a longer list is flagged `truncated`. `summary` counts by type and status.
+
+### get_ad_study [production-safe]
+One study: its cells, its objectives and the results. Meta documents two different places for results:
+- **Lift studies:** each objective's `results` (a JSON string per cell, read with the `cell_id` breakdown). Metrics are grouped by their first word: `population` (test, control, reached), `conversions` and `buyers` (incremental, `incremental_lower` / `_upper`, `confidence`, cost per incremental...), with `spend` and `impressions` at the top. Each group says whether its `confidence` meets the study's `confidence_level` when the study reports one. Conversion Lift is a limited-access Meta product.
+- **Split tests:** there is no results edge. Meta says to compare each cell's efficiency metric, so the tool reads the campaigns and ad sets assigned to each cell and takes their Insights over the study's dates (up to today for a running test): spend, impressions, clicks, CTR, CPM, CPC, purchases, CPA, revenue, ROAS, leads, CPL. `performance_comparison` ranks the cells by CPA (or CPL) when every cell has results, with `vs_best_pct`, and a `caution` when the cells spent very differently. It does not declare a winner or test significance. Creative tests assign ads to cells, which Meta exposes no edge for, so those cells explain why they have no numbers.
+- `study_id` (str): the study ID.
+- `include_results` (bool, default true): set false for just the structure.
+- `account_id` (str, optional): the ad account to read Insights from when a cell's campaigns do not say which account they belong to.
+
+Cells and objectives fail independently of the study: anything Meta refuses is reported under `errors` with the rest still returned.
 
 ## Phase v1.1 Wave 6 - Audiences & Targeting (4 tools)
 

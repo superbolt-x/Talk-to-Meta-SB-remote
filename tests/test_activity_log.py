@@ -196,13 +196,54 @@ class TestStatusBursts:
         assert out["total"] == 3 and sorted(e["object"]["id"] for e in out["events"]) == ["a1", "c8", "c9"]
         assert next(e for e in out["events"] if e["object"]["id"] == "a1")["merged_events"] == 3
 
+    def blip(self, minute, obj="c1"):
+        return [
+            ev(minute, event_type="update_campaign_run_status", obj=obj, sec=5, extra={"old_value": "Pending Process", "new_value": "Active"}),
+            ev(minute, event_type="update_campaign_run_status", obj=obj, sec=1, extra={"old_value": "Active", "new_value": "Pending Process"}),
+        ]
+
     def test_a_blip_that_ends_where_it_began_says_there_was_no_net_change(self, monkeypatch):
-        install(monkeypatch, pages([
-            ev(30, event_type="update_campaign_run_status", obj="c1", sec=5, extra={"old_value": "Pending Process", "new_value": "Active"}),
-            ev(30, event_type="update_campaign_run_status", obj="c1", sec=1, extra={"old_value": "Active", "new_value": "Pending Process"}),
-        ]))
-        e = run()["events"][0]
-        assert e["change"] is None and e["merged_events"] == 2 and "no net change" in e["note"] and "Active" in e["note"]
+        install(monkeypatch, pages(self.blip(30)))
+        e = run(include_status_blips=True)["events"][0]
+        assert e["change"] is None and e["merged_events"] == 2 and e["no_net_change"] is True
+        assert "no net change" in e["note"] and "Active" in e["note"]
+
+    def test_blips_are_hidden_by_default_and_counted(self, monkeypatch):
+        real = ev(50, event_type="update_campaign_budget", obj="c1")
+        install(monkeypatch, pages([real] + self.blip(40) + self.blip(30)))
+        out = run()
+        assert [e["event_type"] for e in out["events"]] == ["update_campaign_budget"]
+        assert out["total"] == 1 and out["summary"]["no_net_change_hidden"] == 2
+        assert out["summary"]["by_type"] == [{"name": "Update campaign budget", "count": 1}]
+
+    def test_blips_do_not_use_up_the_limit(self, monkeypatch):
+        reals = [ev(i, event_type="update_campaign_budget", obj=f"c{i}") for i in range(40, 43)]
+        blips = [e for m in range(10, 30, 2) for e in self.blip(m, obj=f"b{m}")]
+        install(monkeypatch, pages(reals + blips))
+        out = run(limit=3)
+        assert out["total"] == 3 and all(e["event_type"] == "update_campaign_budget" for e in out["events"])
+
+    def test_blips_in_the_newest_window_do_not_stop_the_read_before_older_real_events(self, monkeypatch):
+        newest = [ev(50, event_type="update_campaign_budget", obj="c1")] + self.blip(40, "b1") + self.blip(30, "b2") + self.blip(20, "b3")
+        older = [ev(5, event_type="update_campaign_budget", obj="c2", event_time="2026-08-25T10:00:00+0000"),
+                 ev(6, event_type="update_campaign_budget", obj="c3", event_time="2026-08-24T10:00:00+0000")]
+
+        def handler(endpoint, p, fields):
+            return {"data": newest if int(p["since"]) >= int(NOW.timestamp()) - 30 * 86400 else older}
+
+        install(monkeypatch, handler)
+        out = run(days=60, limit=3)  # four events in the newest window, but only one of them is real
+        assert out["total"] == 3 and [e["object"]["id"] for e in out["events"]] == ["c1", "c2", "c3"]
+        assert out["summary"]["no_net_change_hidden"] == 3
+
+    def test_the_flag_brings_them_back_and_nothing_is_reported_hidden(self, monkeypatch):
+        install(monkeypatch, pages(self.blip(30)))
+        out = run(include_status_blips=True)
+        assert out["total"] == 1 and "no_net_change_hidden" not in out["summary"]
+
+    def test_nothing_hidden_means_no_hidden_count(self, monkeypatch):
+        install(monkeypatch, pages([ev(5)]))
+        assert "no_net_change_hidden" not in run()["summary"]
 
     def test_bursts_for_different_objects_stay_separate(self, monkeypatch):
         install(monkeypatch, pages(self.burst("a1", 23) + self.burst("a2", 22)))
