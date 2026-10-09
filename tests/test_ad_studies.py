@@ -332,6 +332,38 @@ class TestLiftReal:
         assert r["population"] == {"test": 2334212, "control": 123407} and r["spend"] == 26059
         assert "no outcome values" in obj["note"]
 
+    @pytest.mark.parametrize("objective_key", ["objective_id", "objective.id"])
+    def test_the_exact_row_seen_live_on_erie_has_no_results(self, monkeypatch, objective_key):
+        """Seen live (fourth test): population + impressions + spend + the objective's own id said has_results: true,
+        because the id grouped as `objective: {id}` and counted as an outcome."""
+        row = json.dumps({"cell_id": "2151623935790812", objective_key: 1586539596297314, "impressions": 25068568,
+                          "spend": 1182019.55, "population_test": 10515386, "population_control": 911793, "population_reached": 7138624,
+                          "conversions_incremental": None, "sales_incremental": None})
+        install(monkeypatch, self.routes([row]))
+        obj = run_get()["objectives"][0]
+        r = obj["results"][0]
+        assert r["has_results"] is False and obj["has_results"] is False
+        assert "objective" not in r  # its own id is not repeated on its rows
+        assert r == {"cell_id": "2151623935790812", "cell_name": None, "impressions": 25068568, "spend": 1182019.55,
+                     "has_results": False, "population": {"test": 10515386, "control": 911793, "reached": 7138624}}
+
+    def test_an_objective_id_next_to_real_figures_still_counts_as_a_result_and_is_not_repeated(self, monkeypatch):
+        row = json.dumps({"cell_id": "c1", "objective_id": 5, "population_test": 9, "conversions_incremental": 12.0})
+        install(monkeypatch, self.routes([row]))
+        r = run_get()["objectives"][0]["results"][0]
+        assert r["has_results"] is True and "objective" not in r and r["conversions"] == {"incremental": 12.0}
+
+    def test_a_group_of_only_ids_is_not_a_result(self, monkeypatch):
+        row = json.dumps({"cell_id": "c1", "experiment.id": 5001, "population.test": 9})
+        install(monkeypatch, self.routes([row], objectives=[{"id": "o1", "name": "BLS", "type": "BRAND", "is_primary": False}]))
+        r = run_get()["objectives"][0]["results"][0]
+        assert r["experiment"] == {"id": "5001"} and r["has_results"] is False  # kept to tell rows apart, but not an outcome
+
+    def test_a_group_with_an_id_and_a_real_figure_is_a_result(self, monkeypatch):
+        row = json.dumps({"cell_id": "c1", "experiment.id": 5001, "scoreSum.incremental": 0.4})
+        install(monkeypatch, self.routes([row], objectives=[{"id": "o1", "name": "BLS", "type": "BRAND", "is_primary": False}]))
+        assert run_get()["objectives"][0]["results"][0]["has_results"] is True
+
     def test_population_with_an_outcome_is_a_result(self, monkeypatch):
         row = json.dumps({"cell_id": "c1", "population_test": 5, "responders_incremental": 3.0})
         install(monkeypatch, self.routes([row]))
