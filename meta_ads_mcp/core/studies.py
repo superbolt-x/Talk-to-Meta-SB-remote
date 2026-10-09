@@ -24,7 +24,7 @@ from meta_ads_mcp.server import mcp
 from mcp.types import ToolAnnotations
 from meta_ads_mcp.core.api import api_client, MetaAPIError
 from meta_ads_mcp.core.signals import INSIGHT_FIELDS, _aggregate, _parse_day, _value
-from meta_ads_mcp.core.utils import ensure_account_id_format, truncation_fields
+from meta_ads_mcp.core.utils import ensure_account_id_format, get_account_currency, truncation_fields
 
 logger = logging.getLogger("meta-ads-mcp.studies")
 
@@ -51,6 +51,9 @@ LIFT_TOP_LEVEL = ("cell_id", "spend", "impressions")
 _METRIC_KEY = re.compile(r"^([^._]+)[._](.+)$")   # population_test, conversions.incremental, scoreSum.incremental
 _REJECTED_FIELD = re.compile(r"nonexisting field \((\w+)\)", re.I)
 BIG_ID = 10 ** 15                                  # a whole number this big would lose digits in a JSON client
+CONTEXT_GROUPS = ("population",)                   # who was in the test, not what it found
+HOIST_SKIP = ("cell_id", "cell_name", "has_results") + LIFT_TOP_LEVEL
+_ID_KEY = re.compile(r"(?:^|[._])id\d*$|[a-z]Id\d*s?$")  # id, experiment.id, topNAdsId1: always text, whatever the size
 SPEND_SKEW_RATIO = 1.5      # cells spending this many times apart are not comparable
 LEVEL_ID_FIELDS = {"campaign": "campaign_id", "adset": "adset_id"}
 
@@ -295,6 +298,17 @@ def _round(value: Any) -> Any:
     return value
 
 
+def _as_id(value: Any) -> Any:
+    """An ID Meta sent as a number, as text: IDs are labels, not quantities, and large ones lose digits as numbers."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, list):
+        return [_as_id(v) for v in value]
+    return value
+
+
 def _annotate_group(metrics: dict, level: Optional[float]) -> None:
     """Say what Meta's own numbers imply, without changing them: a cost per incremental result means nothing when
     nothing incremental was found, and a range that spans zero cannot be told apart from no effect."""
@@ -315,7 +329,8 @@ def _annotate_group(metrics: dict, level: Optional[float]) -> None:
 def _lift_row(raw: Any, cell_names: dict[str, str], level: Optional[float]) -> Optional[dict]:
     """One lift result (a JSON string per cell) grouped by the first word of each metric, whether Meta separates
     it with an underscore or a dot: population_test -> population.test, scoreSum.incremental -> scoreSum.incremental.
-    Metrics Meta left empty are dropped; a row with nothing left says `has_results: false`."""
+    Metrics Meta left empty are dropped; a row with only who was in the test (population) and delivery figures
+    says `has_results: false`."""
     try:
         data = json.loads(raw) if isinstance(raw, str) else raw
     except ValueError:
@@ -329,9 +344,10 @@ def _lift_row(raw: Any, cell_names: dict[str, str], level: Optional[float]) -> O
             continue
         found = None if key in LIFT_TOP_LEVEL else _METRIC_KEY.match(key)
         if found:
-            groups.setdefault(found.group(1), {})[found.group(2)] = _round(value)
+            groups.setdefault(found.group(1), {})[found.group(2)] = (
+                _as_id(value) if _ID_KEY.search(found.group(2)) else _round(value))
         else:
-            top[key] = _round(value)
+            top[key] = _as_id(value) if _ID_KEY.search(key) else _round(value)
     cell_id = str(data.get("cell_id")) if data.get("cell_id") is not None else None
     kept: dict[str, dict] = {}
     for name, metrics in groups.items():
@@ -341,18 +357,21 @@ def _lift_row(raw: Any, cell_names: dict[str, str], level: Optional[float]) -> O
             kept[name] = metrics
     row: dict[str, Any] = {"cell_id": cell_id, "cell_name": cell_names.get(cell_id or "")}
     row.update({k: v for k, v in top.items() if v is not None})
-    row["has_results"] = bool(kept)
+    row["has_results"] = any(name not in CONTEXT_GROUPS for name in kept)
     row.update(kept)
     return row
 
 
 def _hoist_shared(rows: list[dict]) -> dict:
-    """A list Meta repeats unchanged on every row (such as a brand study's top ads) is moved out once."""
+    """A figure Meta repeats unchanged on every row (such as a brand study's top ads, which come as numbered keys
+    like topNAdsId1) is moved out once. Identity and delivery keys stay on their rows."""
     if len(rows) < 2:
         return {}
     shared: dict[str, Any] = {}
     for name, value in list(rows[0].items()):
-        if isinstance(value, list) and value and all(r.get(name) == value for r in rows[1:]):
+        if name in HOIST_SKIP:
+            continue
+        if not isinstance(value, dict) and value not in (None, [], "") and all(r.get(name) == value for r in rows[1:]):
             shared[name] = value
             for r in rows:
                 r.pop(name, None)
@@ -380,23 +399,34 @@ def _objective_results(objective: dict, cell_names: dict[str, str], level: Optio
     if not rows:
         out["note"] = "No results yet. Meta publishes them once the study has run (see results_first_available)."
     elif not out["has_results"]:
-        out["note"] = "Meta returned this objective with no values, and does not say why."
+        out["note"] = "Meta returned only population and delivery figures for this objective, no outcome values, and does not say why."
     shared = _hoist_shared(rows)
     if shared:
         out["shared"] = shared
     return out
 
 
-def _study_currency(cells: list[dict]) -> Optional[str]:
-    """The currency of the ad accounts behind the first cell, when they all agree (lift `spend` has no currency)."""
-    for cell in cells[:1]:
-        try:
-            accounts, _, _ = _read(f"/{cell['id']}/ad_accounts", ["id", "currency"], ["id"], {"limit": "10"})
-        except MetaAPIError:
-            return None
-        currencies = {a.get("currency") for a in accounts if a.get("currency")}
-        return currencies.pop() if len(currencies) == 1 else None
-    return None
+def _study_currency(cells: list[dict], account_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """The currency of a lift study's `spend` (Meta gives none): the ad account the caller named, else the ad
+    accounts behind the first cell when they all agree. Returns (currency, why_not)."""
+    if account_id:
+        currency = get_account_currency(account_id)
+        if currency:
+            return currency, None
+    if not cells:
+        return None, "the study lists no cells"
+    try:
+        accounts, _, _ = _read(f"/{cells[0]['id']}/ad_accounts", ["id", "currency"], ["id"], {"limit": "10"})
+    except MetaAPIError as e:
+        return None, f"Meta would not list the first cell's ad accounts ({e})"
+    if not accounts:
+        return None, "Meta lists no ad accounts for the first cell"
+    currencies = {a.get("currency") for a in accounts if a.get("currency")}
+    if not currencies:
+        return None, "Meta returned no currency for the cell's ad accounts"
+    if len(currencies) > 1:
+        return None, f"its ad accounts use different currencies ({', '.join(sorted(currencies))})"
+    return currencies.pop(), None
 
 
 def _cell_entities(cell_id: str) -> tuple[list[dict], list[dict], list[str], list[str]]:
@@ -496,8 +526,8 @@ def get_ad_study(
     Args:
         study_id: The study ID.
         include_results: Read results (lift) or per-cell performance (split test). Default true.
-        account_id: Ad account to read Insights from when a cell's campaigns do not say which account they
-            belong to (split tests only).
+        account_id: Ad account. Split tests: where to read Insights when a cell's campaigns do not say which
+            account they belong to. Lift studies: names the currency of `spend`, which Meta does not give.
         max_objectives: Lift objectives whose results are read, primary first (default 25, max 50). A study can
             have 20 or more (one per outcome and channel); the rest are listed without results.
     """
@@ -555,9 +585,9 @@ def get_ad_study(
             response["results_status"] = "interim" if study["status"] in ("running", "observation", "scheduled") else "final"
             if response["results_status"] == "interim":
                 notes.append("The study has not finished, so these results are interim and can still change.")
-            currency = _study_currency(cells) if cells else None
+            currency, why = _study_currency(cells, default_account)
             response["units"] = {
-                "spend": currency or "the currency of the study's ad accounts (not determined here)",
+                "spend": currency or f"the currency of the study's ad accounts (not determined: {why}; pass account_id to name it)",
                 "confidence": "a fraction between 0 and 1",
             }
 

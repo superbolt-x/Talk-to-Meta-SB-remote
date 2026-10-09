@@ -285,7 +285,7 @@ class TestLiftReal:
         install(monkeypatch, self.routes([empty]))
         obj = run_get()["objectives"][0]
         assert obj["results"] == [{"cell_id": "c1", "cell_name": "Test group", "has_results": False}]
-        assert obj["has_results"] is False and "no values, and does not say why" in obj["note"]
+        assert obj["has_results"] is False and "no outcome values, and does not say why" in obj["note"]
 
     def test_spend_and_impressions_survive_when_the_rest_is_empty(self, monkeypatch):
         row = json.dumps({"cell_id": "c1", "spend": 1200, "impressions": 5000, "conversions_incremental": None})
@@ -314,19 +314,67 @@ class TestLiftReal:
         rows = [json.dumps({"cell_id": "c1", "experiment.id": f"e{i}", "topNAdsId": [120216000000000001, 7]}) for i in (1, 2)]
         install(monkeypatch, self.routes(rows))
         obj = run_get()["objectives"][0]
-        assert obj["shared"] == {"topNAdsId": ["120216000000000001", 7]}  # whole numbers too big for JSON clients become text
+        assert obj["shared"] == {"topNAdsId": ["120216000000000001", "7"]}  # IDs are text, whatever their size
         assert all("topNAdsId" not in r for r in obj["results"])
+
+    def test_population_alone_is_not_a_result(self, monkeypatch):
+        """Seen on Erie: rows with only population, impressions and spend said has_results: true."""
+        row = json.dumps({"cell_id": "c1", "population_test": 2334212, "population_control": 123407, "impressions": 19020874,
+                          "spend": 26059, "conversions_incremental": None})
+        install(monkeypatch, self.routes([row]))
+        obj = run_get()["objectives"][0]
+        r = obj["results"][0]
+        assert r["has_results"] is False and obj["has_results"] is False
+        assert r["population"] == {"test": 2334212, "control": 123407} and r["spend"] == 26059
+        assert "no outcome values" in obj["note"]
+
+    def test_population_with_an_outcome_is_a_result(self, monkeypatch):
+        row = json.dumps({"cell_id": "c1", "population_test": 5, "responders_incremental": 3.0})
+        install(monkeypatch, self.routes([row]))
+        assert run_get()["objectives"][0]["results"][0]["has_results"] is True
+
+    def test_a_mix_of_empty_and_real_rows_is_a_result_for_the_objective(self, monkeypatch):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "population_test": 5}),
+                                          json.dumps({"cell_id": "c1", "conversions_incremental": 2.0})]))
+        obj = run_get()["objectives"][0]
+        assert [r["has_results"] for r in obj["results"]] == [False, True] and obj["has_results"] is True and "note" not in obj
+
+    def test_numbered_keys_repeated_on_every_row_are_moved_out_once_with_ids_as_text(self, monkeypatch):
+        """Seen on the brand objective: topNAdsId1-5 and topNAdsSpendPercentage1-5 flat on every row, ids as numbers."""
+        def row(i):
+            return json.dumps({"cell_id": "c1", "experiment.id": 5000 + i, "population.test": 100 + i, "spend": 900, "impressions": 4000,
+                               "topNAdsId1": 52616158977845, "topNAdsId2": 52619260251045, "topNAdsSpendPercentage1": 0.31, "scoreSum.incremental": 0.5 + i})
+        install(monkeypatch, self.routes([row(1), row(2), row(3)], objectives=[{"id": "o1", "name": "BLS", "type": "BRAND", "is_primary": False}]))
+        obj = run_get()["objectives"][0]
+        assert obj["shared"] == {"topNAdsId1": "52616158977845", "topNAdsId2": "52619260251045", "topNAdsSpendPercentage1": 0.31}
+        for r in obj["results"]:
+            assert not any(k.startswith("topN") for k in r)
+            assert r["spend"] == 900 and r["impressions"] == 4000 and r["cell_id"] == "c1"  # delivery and identity stay on the rows
+        assert [r["experiment"]["id"] for r in obj["results"]] == ["5001", "5002", "5003"]  # ids as text, rows told apart
+        assert [r["population"]["test"] for r in obj["results"]] == [101, 102, 103]  # figures that differ stay put
+
+    def test_a_figure_that_differs_on_any_row_is_not_moved(self, monkeypatch):
+        rows = [json.dumps({"cell_id": "c1", "topNAdsSpendPercentage1": v}) for v in (0.3, 0.3, 0.4)]
+        install(monkeypatch, self.routes(rows))
+        obj = run_get()["objectives"][0]
+        assert "shared" not in obj and [r["topNAdsSpendPercentage1"] for r in obj["results"]] == [0.3, 0.3, 0.4]
+
+    @pytest.mark.parametrize("key,is_id", [("topNAdsId1", True), ("topNAdsId", True), ("experiment.id", True), ("id", True), ("adIds", True),
+                                           ("ad_id", True), ("cell_id", True), ("valid", False), ("paid", False), ("spend", False),
+                                           ("identity", False), ("avoid1", False)])
+    def test_id_keys_are_recognised_by_name(self, key, is_id):
+        assert bool(studies._ID_KEY.search(key)) is is_id
 
     def test_a_list_on_a_single_row_stays_where_it_is(self, monkeypatch):
         install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "conversions_incremental": 3.0, "topNAdsId": [1, 2]})]))
         obj = run_get()["objectives"][0]
-        assert obj["results"][0]["topNAdsId"] == [1, 2] and "shared" not in obj
+        assert obj["results"][0]["topNAdsId"] == ["1", "2"] and "shared" not in obj
 
     def test_rows_that_differ_are_not_hoisted(self, monkeypatch):
         rows = [json.dumps({"cell_id": "c1", "topNAdsId": [i, 2]}) for i in (1, 3)]
         install(monkeypatch, self.routes(rows))
         obj = run_get()["objectives"][0]
-        assert "shared" not in obj and obj["results"][0]["topNAdsId"] == [1, 2]
+        assert "shared" not in obj and obj["results"][0]["topNAdsId"] == ["1", "2"]
 
     @pytest.mark.parametrize("value,expected", [
         (120216000000000001, "120216000000000001"), (999999999999999, 999999999999999), (19020874, 19020874),
@@ -407,6 +455,29 @@ class TestLiftReal:
     def test_a_currency_that_cannot_be_determined_is_not_guessed(self, monkeypatch, accounts):
         install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{"/c1/ad_accounts": accounts}))
         assert "not determined" in run_get()["units"]["spend"]
+
+    def test_the_account_named_by_the_caller_gives_the_currency_without_asking_the_cells(self, monkeypatch):
+        monkeypatch.setattr(studies, "get_account_currency", lambda account: "EUR" if account == "act_7" else None)
+        routes = self.routes([json.dumps({"cell_id": "c1", "spend": 5})])
+        del routes["/c1/ad_accounts"]  # would fail the test if it were asked
+        install(monkeypatch, routes)
+        assert run_get(account_id="7")["units"]["spend"] == "EUR"
+
+    def test_an_account_whose_currency_is_unknown_falls_back_to_the_cells(self, monkeypatch):
+        monkeypatch.setattr(studies, "get_account_currency", lambda account: None)
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})]))
+        assert run_get(account_id="7")["units"]["spend"] == "USD"
+
+    @pytest.mark.parametrize("accounts,why", [
+        ({"data": [{"id": "a", "currency": "USD"}, {"id": "b", "currency": "EUR"}]}, "different currencies (EUR, USD)"),
+        ({"data": []}, "lists no ad accounts"),
+        ({"data": [{"id": "a"}]}, "returned no currency"),
+        (MetaAPIError("(#200) denied", error_code=200), "would not list the first cell's ad accounts"),
+    ])
+    def test_when_the_currency_cannot_be_found_the_reason_is_given(self, monkeypatch, accounts, why):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{"/c1/ad_accounts": accounts}))
+        spend = run_get()["units"]["spend"]
+        assert why in spend and "pass account_id to name it" in spend
 
     def test_include_results_false_has_no_units_status_or_currency_call(self, monkeypatch):
         calls = install(monkeypatch, self.routes([]))
