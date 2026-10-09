@@ -406,32 +406,42 @@ def _objective_results(objective: dict, cell_names: dict[str, str], level: Optio
     return out
 
 
+def _cell_accounts(cell_id: Any) -> tuple[dict[str, Optional[str]], list[str]]:
+    """The ad accounts behind a cell as {account id: currency Meta gave, or None}: its own ad accounts, else the
+    accounts of its campaigns, else of its ad sets. Also returns what Meta refused along the way."""
+    problems: list[str] = []
+    for label, edge, fields in (("ad accounts", "adaccounts", ["id", "currency"]),
+                                ("campaigns", "campaigns", ["id", "account_id"]),
+                                ("ad sets", "adsets", ["id", "account_id"])):
+        try:
+            rows, _, _ = _read(f"/{cell_id}/{edge}", fields, ["id"], {"limit": "25"})
+        except MetaAPIError as e:
+            problems.append(f"{label}: {e}")
+            continue
+        accounts: dict[str, Optional[str]] = {}
+        for row in rows:
+            account = row.get("account_id") or (row.get("id") if edge == "adaccounts" else None)
+            if account:
+                accounts[ensure_account_id_format(str(account))] = row.get("currency") if edge == "adaccounts" else None
+        if accounts:
+            return accounts, problems
+    return {}, problems
+
+
 def _study_currency(cells: list[dict], account_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """The currency of a lift study's `spend` (Meta gives none): the ad account the caller named, else the ad
-    accounts of the first cell's campaigns or ad sets when they all agree. Returns (currency, why_not).
-
-    A cell's `ad_accounts` edge is in the SDK but Meta rejects it as a non-existing field, so it is not used."""
+    accounts behind the first cell when they all agree. Returns (currency, why_not)."""
     if account_id:
         currency = get_account_currency(account_id)
         if currency:
             return currency, None
     if not cells:
         return None, "the study lists no cells"
-    accounts: list[str] = []
-    problems: list[str] = []
-    for edge in ("campaigns", "ad_sets"):
-        try:
-            rows, _, _ = _read(f"/{cells[0]['id']}/{edge}", ["id", "account_id"], ["id"], {"limit": "25"})
-        except MetaAPIError as e:
-            problems.append(f"{edge.replace('_', ' ')}: {e}")
-            continue
-        accounts = sorted({ensure_account_id_format(str(r["account_id"])) for r in rows if r.get("account_id")})
-        if accounts:
-            break
+    accounts, problems = _cell_accounts(cells[0]["id"])
     if not accounts:
         return None, ("Meta does not say which ad account the first cell belongs to"
-                      + (f" ({'; '.join(problems)})" if problems else ": it lists no campaigns or ad sets with an account"))
-    found = {a: get_account_currency(a) for a in accounts[:10]}
+                      + (f" ({'; '.join(problems)})" if problems else ": it lists no ad accounts, campaigns or ad sets"))
+    found = {a: given or get_account_currency(a) for a, given in sorted(accounts.items())[:10]}
     unknown = [a for a, c in found.items() if not c]
     if unknown:
         return None, f"could not read the currency of {', '.join(unknown)}"
@@ -446,15 +456,17 @@ def _cell_entities(cell_id: str) -> tuple[list[dict], list[dict], list[str], lis
     edge usable for this. Returns (campaigns, ad_sets, problems, edges_cut_off)."""
     problems: list[str] = []
     cut: list[str] = []
-    found: dict[str, list[dict]] = {"campaigns": [], "ad_sets": []}
-    for edge, fields in (("campaigns", ["id", "name", "account_id"]), ("ad_sets", ["id", "name", "campaign_id", "account_id"])):
+    found: dict[str, list[dict]] = {"campaigns": [], "ad sets": []}
+    # The Graph edge names have no underscore (/adsets), unlike the SDK's method names (get_ad_sets).
+    for label, edge, fields in (("campaigns", "campaigns", ["id", "name", "account_id"]),
+                                ("ad sets", "adsets", ["id", "name", "campaign_id", "account_id"])):
         try:
-            found[edge], more, _ = _read(f"/{cell_id}/{edge}", fields, ["id", "name"], {"limit": str(ENTITY_PAGE)})
+            found[label], more, _ = _read(f"/{cell_id}/{edge}", fields, ["id", "name"], {"limit": str(ENTITY_PAGE)})
             if more:
-                cut.append(edge.replace("_", " "))
+                cut.append(label)
         except MetaAPIError as e:
-            problems.append(f"{edge}: {e}")
-    return found["campaigns"], found["ad_sets"], problems, cut
+            problems.append(f"{label}: {e}")
+    return found["campaigns"], found["ad sets"], problems, cut
 
 
 def _entity_insights(entities: list[dict], level: str, account_default: Optional[str], since: str, until: str,
