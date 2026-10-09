@@ -166,36 +166,56 @@ def _is_pending(value: Any) -> bool:
     return "pending" in str(value or "").lower()
 
 
+def _status_family(event_type: Any) -> Optional[str]:
+    """update_ad_run_status and update_ad_run_status_to_be_set_after_review are one kind of event to a reader:
+    Meta writes both while recording a single pause or activation."""
+    et = str(event_type or "")
+    if et.startswith("update_") and "_run_status" in et:
+        return et[: et.index("_run_status") + len("_run_status")]
+    return None
+
+
 def _merge_status_changes(events: list[dict]) -> list[dict]:
-    """One pause or activation is recorded as several events (Active -> Pending Process, a note, Pending
-    Process -> Inactive). Fold each such burst into one event from the first real state to the last."""
+    """One pause or activation is recorded as several events (Active -> Pending Process, a 'to be set after
+    review' note, Pending Process -> Inactive), sometimes with other objects' events in between. Fold each such
+    burst, for one object within moments, into one event from the first real state to the last. A burst that
+    ends where it began is kept but marked as having no net change."""
     out: list[dict] = []
-    i = 0
-    while i < len(events):
-        ev = events[i]
-        if not str(ev["event_type"] or "").endswith("run_status") or not _parse_time(ev["time"]):
+    used: set[int] = set()
+    for i, ev in enumerate(events):
+        if i in used:
+            continue
+        family, when = _status_family(ev["event_type"]), _parse_time(ev["time"])
+        if not family or not when:
             out.append(ev)
-            i += 1
             continue
         group = [ev]
-        j = i + 1
-        while (j < len(events) and events[j]["event_type"] == ev["event_type"]
-               and events[j]["object"]["id"] == ev["object"]["id"] and _parse_time(events[j]["time"])
-               and abs((_parse_time(ev["time"]) - _parse_time(events[j]["time"])).total_seconds()) <= MERGE_WITHIN_SECONDS):
-            group.append(events[j])
-            j += 1
+        for j in range(i + 1, len(events)):  # newest first, so the gap only grows
+            other, other_time = events[j], _parse_time(events[j]["time"])
+            if other_time is None:
+                continue
+            if (when - other_time).total_seconds() > MERGE_WITHIN_SECONDS:
+                break
+            if j not in used and _status_family(other["event_type"]) == family and other["object"]["id"] == ev["object"]["id"]:
+                group.append(other)
         chrono = list(reversed(group))  # oldest first
         starts = [e["change"]["from"] for e in chrono if e["change"] and e["change"].get("from") and not _is_pending(e["change"]["from"])]
         ends = [e["change"]["to"] for e in chrono if e["change"] and e["change"].get("to") and not _is_pending(e["change"]["to"])]
-        if len(group) > 1 and (starts or ends) and any(
-                e["change"] and (_is_pending(e["change"].get("from")) or _is_pending(e["change"].get("to"))) for e in group):
-            merged = dict(group[0])
-            merged["change"] = {"from": starts[0] if starts else None, "to": ends[-1] if ends else None}
+        touched_pending = any(e["change"] and (_is_pending(e["change"].get("from")) or _is_pending(e["change"].get("to"))) for e in group)
+        if len(group) > 1 and (starts or ends) and touched_pending:
+            used.update(j for j, e in enumerate(events) if any(e is g for g in group))
+            merged = dict(next((g for g in group if g["event_type"] == family), ev))  # the plain status event, not the review note
+            merged["time"], merged["local_time"] = ev["time"], ev["local_time"]
+            frm, to = (starts[0] if starts else None), (ends[-1] if ends else None)
+            if frm is not None and frm == to:
+                merged["change"] = None
+                merged["note"] = f"Went through Pending Process and ended in the same state ({to}); no net change."
+            else:
+                merged["change"] = {"from": frm, "to": to}
             merged["merged_events"] = len(group)
             out.append(merged)
         else:
-            out.extend(group)
-        i = j
+            out.append(ev)
     return out
 
 
@@ -213,8 +233,14 @@ def _hint_for(code: Optional[int]) -> str:
 
 
 def _read_pages(endpoint: str, params: dict, max_pages: int, state: dict) -> tuple[list[dict], bool]:
-    """Raw activity rows for one window, following cursors up to max_pages. Returns (rows, more_exist)."""
+    """Raw activity rows for one window, following cursors up to max_pages. Returns (rows, more_exist).
+
+    On a code-100 rejection the optional parts go in order: the object filter (`oid`), then the richer fields.
+    What Meta rejected is remembered in `state` so later windows do not repeat the failure.
+    """
     params = dict(params)
+    if state["oid_rejected"]:
+        params.pop("oid", None)
     rows: list[dict] = []
     for _ in range(max_pages):
         while True:
@@ -222,6 +248,10 @@ def _read_pages(endpoint: str, params: dict, max_pages: int, state: dict) -> tup
                 res = api_client.graph_get(endpoint, fields=state["fields"], params=params)
                 break
             except MetaAPIError as e:
+                if e.error_code == 100 and "oid" in params:
+                    params.pop("oid")
+                    state["oid_rejected"] = True
+                    continue
                 if e.error_code == 100 and state["fields"] is ACTIVITY_FIELDS:
                     state["fields"] = ACTIVITY_FIELDS_BASIC
                     continue
@@ -261,10 +291,12 @@ def get_activity_log(
         category: Only this category: ACCOUNT, AD, AD_KEYWORDS, AD_SET, AUDIENCE, BID, BUDGET, CAMPAIGN,
             DATE, STATUS or TARGETING.
         user_id: Only changes made by this Facebook user ID.
-        object_id: Events for this campaign / ad set / ad. Uses Meta's per-object history when possible
-            (exact); otherwise scans the account's history and keeps events whose object is this ID.
+        object_id: Events for this campaign / ad set / ad. Meta filters on its side (the account history's
+            `oid` filter) and the result is checked here; if Meta does not apply it, the account's history is
+            scanned up to a read limit and the response says how far back that reached.
         event_type: Only event types containing this text (e.g. 'budget', 'run_status', 'review').
-        limit: Maximum events returned, 1-500 (default 100). The response says how far back they reach.
+        limit: Maximum events returned, 1-500 (default 100). `window.searched_back_to` says how far back the
+            history was actually read; anything older was not looked at.
     """
     api_client._ensure_initialized()
     account_id = ensure_account_id_format(account_id)
@@ -282,17 +314,17 @@ def get_activity_log(
 
     now = _utc_now()
     since = now - timedelta(days=days)
+    wanted_type = event_type.strip().lower() if event_type else None
+    object_id = str(object_id).strip() if object_id else None
     base_params: dict[str, str] = {"limit": str(PAGE_SIZE)}
     if cat:
         base_params["category"] = cat
     if user_id:
         base_params["uid"] = str(user_id).strip()
-    wanted_type = event_type.strip().lower() if event_type else None
-    object_id = str(object_id).strip() if object_id else None
-
-    # Meta's per-object history is exact and cheap. It takes no category / user filter, so those use the account scan.
-    use_object_edge = bool(object_id and not cat and not user_id)
-    client_filter = bool(wanted_type or (object_id and not use_object_edge))
+    if object_id:
+        base_params["oid"] = object_id  # Meta filters on its side; the rows are checked again below
+    client_filter = bool(wanted_type or object_id)
+    # A client-side filter has to read past rows it throws away, so it gets a bigger read budget.
     max_pages = MAX_RAW_PAGES if client_filter else -(-limit // PAGE_SIZE)
     currency = get_account_currency(account_id)
 
@@ -303,44 +335,49 @@ def get_activity_log(
         windows.append((start, end))
         end = start
 
-    state = {"fields": ACTIVITY_FIELDS}
+    state = {"fields": ACTIVITY_FIELDS, "oid_rejected": False}
     notes: list[str] = []
     events: list[dict] = []
     more = False
-    oldest_read: Optional[datetime] = None
+    stopped: Optional[str] = None   # None (read to the start), "limit" (enough events), "cap" (read limit), "error"
+    oldest_read: Optional[datetime] = None   # start of the oldest window read in full
+    oldest_raw: Optional[datetime] = None    # oldest raw event seen
+    raw_read = foreign = 0
     for idx, (start, end) in enumerate(windows):
         params = {**base_params, "since": str(int(start.timestamp())), "until": str(int(end.timestamp()))}
-        endpoint = f"/{object_id}/activities" if use_object_edge else f"/{account_id}/activities"
         try:
-            try:
-                rows, window_more = _read_pages(endpoint, params, max_pages, state)
-            except MetaAPIError as e:
-                if not (use_object_edge and e.error_code == 100):
-                    raise
-                # No per-object history for this kind of ID: scan the account and keep this object's events.
-                use_object_edge, client_filter, max_pages = False, True, MAX_RAW_PAGES
-                notes.append("Meta's per-object history was not available for this ID, so the account's history "
-                             "was scanned and filtered here; very busy accounts may show only part of it.")
-                rows, window_more = _read_pages(f"/{account_id}/activities", params, max_pages, state)
+            rows, window_more = _read_pages(f"/{account_id}/activities", params, max_pages, state)
         except MetaAPIError as e:
-            if oldest_read is None:
+            if oldest_read is None and not events:
                 return {"account_id": account_id, "error": str(e), "error_code": e.error_code, "hint": _hint_for(e.error_code)}
             notes.append(f"History before {end.date().isoformat()} could not be read ({e}); newer events are shown.")
+            stopped = "error"
             break
-        oldest_read = start
+        oldest_read = start  # a window that was not read in full always stops the loop below, so this is the last one read in full
+        raw_read += len(rows)
         for raw in rows:
-            if object_id and not use_object_edge and str(raw.get("object_id")) != object_id:
+            seen = _parse_time(raw.get("event_time"))
+            if seen and (oldest_raw is None or seen < oldest_raw):
+                oldest_raw = seen
+            if object_id and str(raw.get("object_id")) != object_id:
+                foreign += 1
                 continue
             if wanted_type and wanted_type not in (str(raw.get("event_type", "")) + " " + str(raw.get("translated_event_type", ""))).lower():
                 continue
             events.append(_normalize_event(raw, currency))
         events = _merge_status_changes(events)
-        if len(events) >= limit:
+        # Stop as soon as a window was not read to its start: carrying on to an older window would leave a gap.
+        if window_more or len(events) >= limit:
             more = window_more or len(events) > limit or idx < len(windows) - 1
+            stopped = "cap" if (window_more and len(events) < limit) else "limit"
             break
-        if window_more:
-            more = True
     events = events[:limit]
+
+    if object_id and state["oid_rejected"]:
+        notes.append("Meta did not accept its object filter, so the account's history was scanned and filtered here.")
+    elif foreign:
+        notes.append(f"Meta did not apply the object filter on its side ({foreign} events for other objects came back "
+                     "and were left out), so only part of a busy account's history may have been searched.")
 
     by_type: dict[str, int] = {}
     by_actor: dict[str, int] = {}
@@ -349,25 +386,38 @@ def get_activity_log(
         actor = ev["actor"]["name"] or ev["actor"]["id"] or "Unknown"
         by_actor[actor] = by_actor.get(actor, 0) + 1
 
+    if stopped is None:
+        searched_back_to = since
+    elif stopped == "error":
+        searched_back_to = oldest_read or now
+    else:
+        searched_back_to = oldest_raw or since
     reaches_back_to = events[-1]["time"] if (more and events) else (oldest_read or since).isoformat()
+
+    narrow_hint = "Raise limit (max 500), shorten days, or narrow with category, object_id or user_id."
+    if stopped == "cap":
+        narrow_hint = ("The read limit was reached before the start of the window, so older changes were not "
+                       "searched. Shorten days, or narrow with category or user_id.")
+        notes.append(f"Read {raw_read} events back to {searched_back_to.date().isoformat()} and stopped; "
+                     f"{'older changes' if events else 'anything older'} were not searched.")
     response: dict[str, Any] = {
         "account_id": account_id,
         "window": {"since": since.isoformat(), "until": now.isoformat(), "days": days,
-                   "events_reach_back_to": reaches_back_to},
+                   "searched_back_to": searched_back_to.isoformat(),
+                   "events_reach_back_to": reaches_back_to, "events_read": raw_read},
         "filters": {k: v for k, v in (("category", cat), ("user_id", user_id), ("object_id", object_id),
                                       ("event_type", event_type)) if v},
         "total": len(events),
         "summary": {"by_type": _top(by_type), "by_actor": _top(by_actor),
                     "newest": events[0]["time"] if events else None,
                     "oldest": events[-1]["time"] if events else None},
-        **truncation_fields({"next": "more"} if more else None, len(events),
-                            "Raise limit (max 500), shorten days, or narrow with category, object_id or user_id."),
+        **truncation_fields({"next": "more"} if more else None, len(events), narrow_hint),
         "events": events,
         "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
     }
     if notes:
         response["notes"] = notes
-    if not events:
+    if not events and stopped != "cap":
         response["note"] = ("No changes found in this window. Meta may keep less history than requested, "
                             "or the filters excluded everything.")
     return response
