@@ -16,6 +16,7 @@ Docs: https://developers.facebook.com/documentation/ads-commerce/marketing-api/r
 """
 import json
 import logging
+import re
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
@@ -40,12 +41,16 @@ PAGE_SIZE = 100
 MAX_PAGES = 5               # studies read for a list (500)
 MAX_LIMIT = 100
 MAX_CELLS = 20
-MAX_OBJECTIVES = 10
+MAX_OBJECTIVES = 50
+DEFAULT_OBJECTIVES = 25      # a study can have 20+ objectives (one per outcome and channel)
 ENTITY_PAGE = 100           # campaigns / ad sets read per cell
 ENTITY_EXAMPLES = 10
 INSIGHT_ID_CHUNK = 50
-STATUSES = ("scheduled", "running", "observation", "completed", "canceled", "unknown")
+STATUSES = ("scheduled", "running", "observation", "completed", "canceled", "recurring_config", "unknown")
 LIFT_TOP_LEVEL = ("cell_id", "spend", "impressions")
+_METRIC_KEY = re.compile(r"^([^._]+)[._](.+)$")   # population_test, conversions.incremental, scoreSum.incremental
+_REJECTED_FIELD = re.compile(r"nonexisting field \((\w+)\)", re.I)
+BIG_ID = 10 ** 15                                  # a whole number this big would lose digits in a JSON client
 SPEND_SKEW_RATIO = 1.5      # cells spending this many times apart are not comparable
 LEVEL_ID_FIELDS = {"campaign": "campaign_id", "adset": "adset_id"}
 
@@ -79,6 +84,8 @@ def _status(raw: dict, now: datetime) -> str:
     """Where a study is in its life, worked out from its dates (Meta has no status field on the study)."""
     if _parse_time(raw.get("canceled_time")):
         return "canceled"
+    if str(raw.get("type") or "").upper() == "CONTINUOUS_LIFT_CONFIG":
+        return "recurring_config"  # a template that starts studies, not a study run
     start, end, observed = (_parse_time(raw.get(k)) for k in ("start_time", "end_time", "observation_end_time"))
     if not start:
         return "unknown"
@@ -126,13 +133,25 @@ def _hint_for(code: Optional[int]) -> str:
     return "Meta rejected the request."
 
 
-def _read(endpoint: str, fields: list[str], fallback: Optional[list[str]], params: Optional[dict] = None,
-          max_pages: int = 1) -> tuple[list[dict], bool, bool]:
-    """Rows from an edge, following cursors up to max_pages, retrying with `fallback` fields if Meta rejects one.
+def _next_fields(fields: list[str], error: MetaAPIError, basic: Optional[list[str]]) -> Optional[list[str]]:
+    """The fields to retry with after Meta rejects one: just the one it names when it names one, otherwise the
+    basic set. None when there is nothing left to drop."""
+    named = _REJECTED_FIELD.search(str(error))
+    if named and named.group(1) in fields:
+        return [f for f in fields if f != named.group(1)]
+    if basic and fields != basic:
+        return list(basic)
+    return None
 
-    Returns (rows, more_exist, used_fallback)."""
+
+def _read(endpoint: str, fields: list[str], fallback: Optional[list[str]], params: Optional[dict] = None,
+          max_pages: int = 1) -> tuple[list[dict], bool, list[str]]:
+    """Rows from an edge, following cursors up to max_pages. When Meta rejects a field with a code 100, only the
+    field it names is dropped (or the `fallback` set when it names none) and the read retried.
+
+    Returns (rows, more_exist, fields_dropped)."""
     params = dict(params or {})
-    chosen, used_fallback = fields, False
+    chosen = list(fields)
     rows: list[dict] = []
     for _ in range(max_pages):
         while True:
@@ -140,17 +159,30 @@ def _read(endpoint: str, fields: list[str], fallback: Optional[list[str]], param
                 res = api_client.graph_get(endpoint, fields=chosen, params=params)
                 break
             except MetaAPIError as e:
-                if e.error_code == 100 and fallback and chosen is fields:
-                    chosen, used_fallback = fallback, True
-                    continue
-                raise
+                retry = _next_fields(chosen, e, fallback) if e.error_code == 100 else None
+                if retry is None:
+                    raise
+                chosen = retry
         rows.extend(r for r in res.get("data", []) if isinstance(r, dict))
         paging = res.get("paging") or {}
         cursor = (paging.get("cursors") or {}).get("after")
         if not paging.get("next") or not cursor:
-            return rows, False, used_fallback
+            return rows, False, [f for f in fields if f not in chosen]
         params["after"] = cursor
-    return rows, True, used_fallback
+    return rows, True, [f for f in fields if f not in chosen]
+
+
+def _get_node(endpoint: str, fields: list[str], fallback: list[str]) -> tuple[dict, list[str]]:
+    """One object (no `data` list), with the same field-by-field retry as _read."""
+    chosen = list(fields)
+    while True:
+        try:
+            return api_client.graph_get(endpoint, fields=chosen), [f for f in fields if f not in chosen]
+        except MetaAPIError as e:
+            retry = _next_fields(chosen, e, fallback) if e.error_code == 100 else None
+            if retry is None:
+                raise
+            chosen = retry
 
 
 # ----------------------------------------------------------------------------- list
@@ -225,18 +257,21 @@ def list_ad_studies(
     for s in studies:
         by_type[s["type"] or "UNKNOWN"] = by_type.get(s["type"] or "UNKNOWN", 0) + 1
         by_status[s["status"]] = by_status.get(s["status"], 0) + 1
+    cut_off = truncation_fields({"next": "more"} if more else None, len(rows),
+                                "Studies are read newest-first up to a limit; filter by study_type or status to narrow.")
+    if len(studies) > limit and not cut_off["truncated"]:
+        cut_off = {"truncated": True,
+                   "truncation_note": (f"Showing the newest {limit} of {len(studies)} found; total and the summary cover "
+                                       f"all {len(studies)}. Raise limit (max {MAX_LIMIT}) to see more.")}
     response: dict[str, Any] = {
         "scope": {"type": "account", "id": account} if account and not notes else {"type": "business", "id": business},
         "filters": {k: v for k, v in (("study_type", study_type), ("status", status)) if v},
         "total": len(studies),
         "summary": {"by_type": by_type, "by_status": by_status},
         "studies": studies[:limit],
-        **truncation_fields({"next": "more"} if more else None, len(rows),
-                            "Studies are read newest-first up to a limit; filter by study_type or status to narrow."),
+        **cut_off,
         "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
     }
-    if len(studies) > limit:
-        response["studies_note"] = f"Showing the newest {limit} of {len(studies)}; raise limit (max {MAX_LIMIT}) to see more."
     if notes:
         response["notes"] = notes
     if not studies:
@@ -247,36 +282,87 @@ def list_ad_studies(
 # ----------------------------------------------------------------------------- one study
 
 def _round(value: Any) -> Any:
-    if isinstance(value, bool) or not isinstance(value, float):
+    """Numbers as a person reads them: floats rounded, and whole numbers too big to survive a JSON client
+    (Meta's ad IDs, for one) as text so no digits are lost."""
+    if isinstance(value, bool) or value is None:
         return value
-    return round(value, 4 if abs(value) < 1 else 2)
+    if isinstance(value, int):
+        return str(value) if abs(value) >= BIG_ID else value
+    if isinstance(value, float):
+        return round(value, 4 if abs(value) < 1 else 2)
+    if isinstance(value, list):
+        return [_round(v) for v in value]
+    return value
+
+
+def _annotate_group(metrics: dict, level: Optional[float]) -> None:
+    """Say what Meta's own numbers imply, without changing them: a cost per incremental result means nothing when
+    nothing incremental was found, and a range that spans zero cannot be told apart from no effect."""
+    incremental = metrics.get("incremental")
+    cost_keys = [k for k in metrics if k.startswith("CPi")]
+    if cost_keys and isinstance(incremental, (int, float)) and incremental <= 0:
+        for key in cost_keys:
+            metrics[key] = None
+        metrics["cost_per_incremental_note"] = "No positive incremental result, so a cost per incremental result is not meaningful."
+    low, high = metrics.get("incremental_lower"), metrics.get("incremental_upper")
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (low, high)):
+        metrics["range_includes_zero"] = low <= 0 <= high
+    confidence = metrics.get("confidence")
+    if level is not None and isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        metrics["meets_study_confidence_level"] = confidence >= level
 
 
 def _lift_row(raw: Any, cell_names: dict[str, str], level: Optional[float]) -> Optional[dict]:
-    """One lift result (a JSON string per cell) grouped by the first word of each metric:
-    population_test -> population.test, conversions_incremental -> conversions.incremental."""
+    """One lift result (a JSON string per cell) grouped by the first word of each metric, whether Meta separates
+    it with an underscore or a dot: population_test -> population.test, scoreSum.incremental -> scoreSum.incremental.
+    Metrics Meta left empty are dropped; a row with nothing left says `has_results: false`."""
     try:
         data = json.loads(raw) if isinstance(raw, str) else raw
     except ValueError:
         return {"raw": str(raw)[:300]}
     if not isinstance(data, dict):
         return None
-    out: dict[str, Any] = {}
+    top: dict[str, Any] = {}
     groups: dict[str, dict] = {}
     for key, value in data.items():
-        if key in LIFT_TOP_LEVEL or "_" not in key:
-            out[key] = _round(value)
+        if key == "cell_id":
+            continue
+        found = None if key in LIFT_TOP_LEVEL else _METRIC_KEY.match(key)
+        if found:
+            groups.setdefault(found.group(1), {})[found.group(2)] = _round(value)
         else:
-            group, rest = key.split("_", 1)
-            groups.setdefault(group, {})[rest] = _round(value)
+            top[key] = _round(value)
     cell_id = str(data.get("cell_id")) if data.get("cell_id") is not None else None
-    ordered: dict[str, Any] = {"cell_id": cell_id, "cell_name": cell_names.get(cell_id or "")}
-    ordered.update({k: v for k, v in out.items() if k != "cell_id"})
+    kept: dict[str, dict] = {}
     for name, metrics in groups.items():
-        if level is not None and isinstance(metrics.get("confidence"), (int, float)):
-            metrics["meets_study_confidence_level"] = metrics["confidence"] >= level
-        ordered[name] = metrics
-    return ordered
+        metrics = {k: v for k, v in metrics.items() if v is not None}
+        if metrics:
+            _annotate_group(metrics, level)
+            kept[name] = metrics
+    row: dict[str, Any] = {"cell_id": cell_id, "cell_name": cell_names.get(cell_id or "")}
+    row.update({k: v for k, v in top.items() if v is not None})
+    row["has_results"] = bool(kept)
+    row.update(kept)
+    return row
+
+
+def _hoist_shared(rows: list[dict]) -> dict:
+    """A list Meta repeats unchanged on every row (such as a brand study's top ads) is moved out once."""
+    if len(rows) < 2:
+        return {}
+    shared: dict[str, Any] = {}
+    for name, value in list(rows[0].items()):
+        if isinstance(value, list) and value and all(r.get(name) == value for r in rows[1:]):
+            shared[name] = value
+            for r in rows:
+                r.pop(name, None)
+        elif isinstance(value, dict):
+            for key, inner in list(value.items()):
+                if isinstance(inner, list) and inner and all(isinstance(r.get(name), dict) and r[name].get(key) == inner for r in rows[1:]):
+                    shared[f"{name}.{key}"] = inner
+                    for r in rows:
+                        r[name].pop(key, None)
+    return shared
 
 
 def _objective_results(objective: dict, cell_names: dict[str, str], level: Optional[float]) -> dict:
@@ -288,11 +374,29 @@ def _objective_results(objective: dict, cell_names: dict[str, str], level: Optio
         out["error"] = str(e)
         return out
     out["last_updated_results"] = res.get("last_updated_results") or out["last_updated_results"]
-    results = [_lift_row(r, cell_names, level) for r in (res.get("results") or [])]
-    out["results"] = [r for r in results if r]
-    if not out["results"]:
+    rows = [r for r in (_lift_row(r, cell_names, level) for r in (res.get("results") or [])) if r]
+    out["results"] = rows
+    out["has_results"] = any(r.get("has_results") for r in rows)
+    if not rows:
         out["note"] = "No results yet. Meta publishes them once the study has run (see results_first_available)."
+    elif not out["has_results"]:
+        out["note"] = "Meta returned this objective with no values, and does not say why."
+    shared = _hoist_shared(rows)
+    if shared:
+        out["shared"] = shared
     return out
+
+
+def _study_currency(cells: list[dict]) -> Optional[str]:
+    """The currency of the ad accounts behind the first cell, when they all agree (lift `spend` has no currency)."""
+    for cell in cells[:1]:
+        try:
+            accounts, _, _ = _read(f"/{cell['id']}/ad_accounts", ["id", "currency"], ["id"], {"limit": "10"})
+        except MetaAPIError:
+            return None
+        currencies = {a.get("currency") for a in accounts if a.get("currency")}
+        return currencies.pop() if len(currencies) == 1 else None
+    return None
 
 
 def _cell_entities(cell_id: str) -> tuple[list[dict], list[dict], list[str], list[str]]:
@@ -378,6 +482,7 @@ def get_ad_study(
     study_id: str,
     include_results: bool = True,
     account_id: Optional[str] = None,
+    max_objectives: int = DEFAULT_OBJECTIVES,
 ) -> dict:
     """
     One A/B test or conversion lift study: its cells, its objectives and the results. Read-only.
@@ -393,26 +498,28 @@ def get_ad_study(
         include_results: Read results (lift) or per-cell performance (split test). Default true.
         account_id: Ad account to read Insights from when a cell's campaigns do not say which account they
             belong to (split tests only).
+        max_objectives: Lift objectives whose results are read, primary first (default 25, max 50). A study can
+            have 20 or more (one per outcome and channel); the rest are listed without results.
     """
     api_client._ensure_initialized()
     study_id = str(study_id).strip()
     if not study_id.isdigit():
         return {"error": "study_id must be a numeric ID", "blocked_at": "input_validation"}
+    if not 1 <= int(max_objectives) <= MAX_OBJECTIVES:
+        return {"error": f"max_objectives must be between 1 and {MAX_OBJECTIVES}", "blocked_at": "input_validation"}
+    max_objectives = int(max_objectives)
     default_account = ensure_account_id_format(account_id) if account_id else None
 
     now = _utc_now()
     errors: dict[str, str] = {}
     notes: list[str] = []
     try:
-        try:
-            node = api_client.graph_get(f"/{study_id}", fields=STUDY_FIELDS)
-        except MetaAPIError as e:
-            if e.error_code != 100:
-                raise
-            node = api_client.graph_get(f"/{study_id}", fields=STUDY_FIELDS_BASIC)
+        node, unavailable = _get_node(f"/{study_id}", STUDY_FIELDS, STUDY_FIELDS_BASIC)
     except MetaAPIError as e:
         return {"study_id": study_id, "error": str(e), "error_code": e.error_code, "hint": _hint_for(e.error_code)}
     study = _study(node, now)
+    if unavailable:
+        notes.append(f"Meta would not return {', '.join(unavailable)} for this study, so they show as empty.")
 
     cells_raw: list[dict] = []
     try:
@@ -435,11 +542,24 @@ def get_ad_study(
     response: dict[str, Any] = {"study": study, "cells": cells}
     if objectives_raw:
         level = study["confidence_level"]
-        shown = objectives_raw[:MAX_OBJECTIVES]
-        response["objectives"] = ([_objective_results(o, cell_names, level) for o in shown] if include_results
-                                  else [{k: o.get(k) for k in ("id", "name", "type", "is_primary", "last_updated_results")} for o in shown])
-        if len(objectives_raw) > MAX_OBJECTIVES:
-            notes.append(f"Showing the first {MAX_OBJECTIVES} of {len(objectives_raw)} objectives.")
+        objectives_raw.sort(key=lambda o: not o.get("is_primary"))  # primary first, order otherwise kept
+        read, rest = objectives_raw[:max_objectives], objectives_raw[max_objectives:]
+        plain = lambda o: {k: o.get(k) for k in ("id", "name", "type", "is_primary", "last_updated_results")}
+        response["objectives"] = ([_objective_results(o, cell_names, level) for o in read] if include_results
+                                  else [plain(o) for o in read])
+        if rest:
+            response["objectives"] += [{**plain(o), "results_read": False} for o in rest]
+            notes.append(f"Results were read for the first {max_objectives} of {len(objectives_raw)} objectives (primary "
+                         f"first); the other {len(rest)} are listed without results. Raise max_objectives (max {MAX_OBJECTIVES}).")
+        if include_results:
+            response["results_status"] = "interim" if study["status"] in ("running", "observation", "scheduled") else "final"
+            if response["results_status"] == "interim":
+                notes.append("The study has not finished, so these results are interim and can still change.")
+            currency = _study_currency(cells) if cells else None
+            response["units"] = {
+                "spend": currency or "the currency of the study's ad accounts (not determined here)",
+                "confidence": "a fraction between 0 and 1",
+            }
 
     if include_results and _is_split(study["type"]) and cells:
         start, end = _parse_time(study["start"]), _parse_time(study["end"])

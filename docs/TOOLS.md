@@ -307,20 +307,21 @@ One request per format. A format Meta cannot build for the ad (for example a Ree
 A/B tests (split tests) and conversion lift studies, newest first. Meta stores both as "ad studies".
 - `account_id` (str) or `business_id` (str): give exactly one. An account is read from its own `ad_studies` edge; if Meta has none, the owning business is read and a note says so.
 - `study_type` (str, optional): contains-match, case-insensitive: `SPLIT` (split tests), `LIFT` (lift and geo lift), or an exact type such as `SPLIT_TEST_V2`.
-- `status` (str, optional): `scheduled`, `running`, `observation`, `completed` or `canceled`. Meta has no status field on a study, so it is worked out from the dates.
+- `status` (str, optional): `scheduled`, `running`, `observation`, `completed`, `canceled` or `recurring_config`. Meta has no status field on a study, so it is worked out from the dates. A `CONTINUOUS_LIFT_CONFIG` is a template that starts studies, not a study run, so it is `recurring_config` and never counted as running.
 - `limit` (int, default 25, max 100).
 
-Up to 500 studies are read; a longer list is flagged `truncated`. `summary` counts by type and status.
+Up to 500 studies are read. A list cut at `limit` or at that read limit is flagged `truncated` with a note; `total` and `summary` (counts by type and status) cover every study found.
 
 ### get_ad_study [production-safe]
 One study: its cells, its objectives and the results. Meta documents two different places for results:
-- **Lift studies:** each objective's `results` (a JSON string per cell, read with the `cell_id` breakdown). Metrics are grouped by their first word: `population` (test, control, reached), `conversions` and `buyers` (incremental, `incremental_lower` / `_upper`, `confidence`, cost per incremental...), with `spend` and `impressions` at the top. Each group says whether its `confidence` meets the study's `confidence_level` when the study reports one. Conversion Lift is a limited-access Meta product.
+- **Lift studies:** each objective's `results` (a JSON string per cell, read with the `cell_id` breakdown). Metrics are grouped by their first word, whether Meta separates it with an underscore or a dot: `population` (test, control, reached), `conversions`, `sales` and `buyers` (incremental, `incremental_lower` / `_upper`, `confidence`, cost per incremental...), brand-lift groups such as `scoreSum` and `isWinner`, with `spend` and `impressions` at the top. Metrics Meta left empty are dropped, and a row with nothing left says `has_results: false` (the objective says so too, with a note that Meta does not say why). A list Meta repeats on every row (a brand study's top ads) is moved once to the objective's `shared`, and ad IDs come back as text so no digits are lost. Each group says `range_includes_zero` (its incremental range spans zero, so it cannot be told apart from no effect) and, when the study reports a `confidence_level`, whether its `confidence` meets it. A cost per incremental result is blanked, with a note, when the incremental result is zero or negative. `results_status` is `interim` while the study is running or observing (results can still change) and `final` after; `units` gives the spend currency (from the cell's ad accounts when they agree) and says `confidence` is a fraction between 0 and 1. Conversion Lift is a limited-access Meta product.
 - **Split tests:** there is no results edge. Meta says to compare each cell's efficiency metric, so the tool reads the campaigns and ad sets assigned to each cell and takes their Insights over the study's dates (up to today for a running test): spend, impressions, clicks, CTR, CPM, CPC, purchases, CPA, revenue, ROAS, leads, CPL. `performance_comparison` ranks the cells by CPA (or CPL) when every cell has results, with `vs_best_pct`, and a `caution` when the cells spent very differently. It does not declare a winner or test significance. Creative tests assign ads to cells, which Meta exposes no edge for, so those cells explain why they have no numbers.
 - `study_id` (str): the study ID.
 - `include_results` (bool, default true): set false for just the structure.
 - `account_id` (str, optional): the ad account to read Insights from when a cell's campaigns do not say which account they belong to.
+- `max_objectives` (int, default 25, max 50): objectives whose results are read, primary first. A study can have 20 or more (one per outcome and channel); any beyond the limit are listed with `results_read: false` and a note.
 
-Cells and objectives fail independently of the study: anything Meta refuses is reported under `errors` with the rest still returned.
+Cells and objectives fail independently of the study: anything Meta refuses is reported under `errors` with the rest still returned. If Meta will not return one header field (`confidence_level` is often refused), only that field is dropped and named in `notes`; the rest, including the dates the status depends on, are kept.
 
 ## Phase v1.1 Wave 6 - Audiences & Targeting (4 tools)
 
