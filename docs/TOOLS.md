@@ -293,6 +293,16 @@ Campaigns, ad sets and ads Meta has flagged as not delivering properly: effectiv
 
 The answer leads with `scope` (`{"type": "account"|"campaign", "id": ...}`), `total`, `summary` (counts by level and status) and `reasons`: one entry per distinct problem with how many entities have it (counted once per entity), the levels, and three examples. Ad review feedback, which Meta repeats under `global` and every placement, is folded into `review_reasons` (policy, text, placements) and also counts as a `Review: <policy>` reason. `entities_note` says when the list was cut to `max_entities`. Up to 300 entities per level are read; a longer list is flagged `truncated`. A level that errors is reported under `errors` and never counted as clean.
 
+## Phase v1.1 Wave 5d - Previews & Experiment Results (1 tool so far)
+
+### get_ad_previews [production-safe]
+Links to see how an ad looks in each placement (feed, Instagram, stories, Reels...). Meta answers with an HTML iframe; the tool unpacks it into a plain link with its size. The links are Meta-signed and expire (Meta documents about 24 hours), so open them now rather than saving them.
+- `ad_id` (str) or `creative_id` (str): give exactly one.
+- `ad_formats` (str, default `DESKTOP_FEED_STANDARD,MOBILE_FEED_STANDARD,INSTAGRAM_STANDARD`): comma-separated placements, up to 6 (also e.g. `INSTAGRAM_STORY`, `INSTAGRAM_REELS`, `FACEBOOK_STORY_MOBILE`, `FACEBOOK_REELS_MOBILE`, `RIGHT_COLUMN_STANDARD`).
+- `locale` (str, optional): such as `en_US`.
+
+One request per format. A format Meta cannot build for the ad (for example a Reels format for an image ad) is reported under `errors` and does not hide the others.
+
 ## Phase v1.1 Wave 6 - Audiences & Targeting (4 tools)
 
 ### list_custom_audiences [production-safe]
