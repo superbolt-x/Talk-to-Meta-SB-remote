@@ -32,7 +32,7 @@ PAGE_SIZE = 100
 MAX_PAGES = 3
 MAX_REASONS = 15
 EXAMPLES_PER_REASON = 3
-DEFAULT_MAX_ENTITIES = 25
+DEFAULT_MAX_ENTITIES = 5
 MAX_ENTITIES = 1000
 
 
@@ -154,7 +154,7 @@ def get_delivery_errors(
         statuses: Comma-separated effective statuses to treat as a problem (default
             WITH_ISSUES, DISAPPROVED, PENDING_BILLING_INFO).
         recent_days: Only entities updated in the last N days (1-365). Default: all flagged entities.
-        max_entities: Entities listed per level, most recently updated first (default 25, max 1000, 0 for
+        max_entities: Entities listed per level, most recently updated first (default 5, max 1000, 0 for
             none). The summary and reasons always cover everything read.
     """
     api_client._ensure_initialized()

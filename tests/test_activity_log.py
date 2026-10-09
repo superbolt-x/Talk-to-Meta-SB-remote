@@ -167,9 +167,12 @@ class TestNormalization:
 
 class TestStatusBursts:
     def burst(self, obj="a1", minute=23):
-        return [  # newest first, as Meta returns them
+        """One real pause, newest first: Meta writes the middle event under its own type
+        (update_ad_run_status_to_be_set_after_review), not update_ad_run_status."""
+        return [
             ev(minute, event_type="update_ad_run_status", obj=obj, sec=9, extra={"old_value": "Pending Process", "new_value": "Inactive"}),
-            ev(minute, event_type="update_ad_run_status", obj=obj, sec=8, extra={"old_value": "to be set after review", "new_value": "Inactive"}),
+            ev(minute, event_type="update_ad_run_status_to_be_set_after_review", obj=obj, sec=8,
+               extra={"old_value": "Active", "new_value": "Inactive"}),
             ev(minute, event_type="update_ad_run_status", obj=obj, sec=7, extra={"old_value": "Active", "new_value": "Pending Process"}),
         ]
 
@@ -180,6 +183,26 @@ class TestStatusBursts:
         e = out["events"][0]
         assert e["change"] == {"from": "Active", "to": "Inactive"} and e["merged_events"] == 3
         assert out["summary"]["by_type"] == [{"name": "Update ad run status", "count": 1}]
+
+    def test_the_merged_event_is_the_plain_status_event_not_the_review_note(self, monkeypatch):
+        install(monkeypatch, pages(self.burst()))
+        e = run()["events"][0]
+        assert e["event_type"] == "update_ad_run_status" and e["time"] == "2026-10-07T10:23:09+0000"
+
+    def test_other_objects_events_in_between_do_not_stop_the_merge(self, monkeypatch):
+        b = self.burst()
+        install(monkeypatch, pages([b[0], ev(23, obj="c9", sec=8), b[1], ev(23, obj="c8", sec=7), b[2]]))
+        out = run()
+        assert out["total"] == 3 and sorted(e["object"]["id"] for e in out["events"]) == ["a1", "c8", "c9"]
+        assert next(e for e in out["events"] if e["object"]["id"] == "a1")["merged_events"] == 3
+
+    def test_a_blip_that_ends_where_it_began_says_there_was_no_net_change(self, monkeypatch):
+        install(monkeypatch, pages([
+            ev(30, event_type="update_campaign_run_status", obj="c1", sec=5, extra={"old_value": "Pending Process", "new_value": "Active"}),
+            ev(30, event_type="update_campaign_run_status", obj="c1", sec=1, extra={"old_value": "Active", "new_value": "Pending Process"}),
+        ]))
+        e = run()["events"][0]
+        assert e["change"] is None and e["merged_events"] == 2 and "no net change" in e["note"] and "Active" in e["note"]
 
     def test_bursts_for_different_objects_stay_separate(self, monkeypatch):
         install(monkeypatch, pages(self.burst("a1", 23) + self.burst("a2", 22)))
@@ -251,6 +274,21 @@ class TestWindows:
         complete = run(days=7)
         assert complete["window"]["events_reach_back_to"] == "2026-10-01T12:00:00+00:00" and complete["truncated"] is False
 
+    def test_searched_back_to_is_the_window_start_when_it_was_read_in_full(self, monkeypatch):
+        install(monkeypatch, pages([ev(5)]))
+        out = run(days=45)
+        assert out["window"]["searched_back_to"] == out["window"]["since"] and out["window"]["events_read"] == 2  # one event in each of the two chunks
+
+    def test_searched_back_to_stops_at_the_last_chunk_read_when_an_older_one_fails(self, monkeypatch):
+        def handler(endpoint, p, fields):
+            if int(p["since"]) < int(NOW.timestamp()) - 60 * 86400:
+                return MetaAPIError("An unknown error occurred", error_code=1)
+            return {"data": [ev(5)]}
+
+        install(monkeypatch, handler)
+        out = run(days=90, limit=500)
+        assert out["window"]["searched_back_to"] == "2026-08-09T12:00:00+00:00"
+
     def test_fields_fall_back_if_meta_rejects_one(self, monkeypatch):
         seen = []
 
@@ -271,41 +309,93 @@ class TestWindows:
 # ================================================================ object scoping and filters
 
 class TestObjectScoping:
-    def test_an_object_uses_its_own_history_with_no_client_filtering(self, monkeypatch):
-        calls = install(monkeypatch, pages([ev(2, obj="c1"), ev(1, obj="s9", event_type="update_ad_set_budget")]))
-        out = run(object_id="c1")
-        assert [c["endpoint"] for c in activity_calls(calls)] == ["/c1/activities"]
-        assert out["total"] == 2  # Meta decides what belongs to the object; child events are kept
-        assert "category" not in activity_calls(calls)[0]["params"]
+    """Meta has a per-object activities edge only for ad sets, so a campaign or ad is asked for through the
+    account's own edge with its `oid` filter."""
 
-    def test_if_meta_has_no_per_object_history_the_account_is_scanned_and_filtered(self, monkeypatch):
-        events = [ev(i % 59, obj="c1" if i % 10 == 0 else "other") for i in range(250)]
-        inner = pages(events)
+    def test_an_object_is_asked_for_on_the_account_edge_with_the_oid_filter(self, monkeypatch):
+        calls = install(monkeypatch, pages([ev(2, obj="c1"), ev(1, obj="c1")]))
+        out = run(object_id="c1")
+        sent = activity_calls(calls)
+        assert [c["endpoint"] for c in sent] == ["/act_1/activities"] and sent[0]["params"]["oid"] == "c1"
+        assert out["total"] == 2 and "notes" not in out and out["truncated"] is False
+
+    def test_category_and_user_filters_travel_in_the_same_request(self, monkeypatch):
+        calls = install(monkeypatch, pages([ev(2, obj="c1")]))
+        run(object_id="c1", category="budget", user_id="5")
+        sent = activity_calls(calls)
+        assert len(sent) == 1 and sent[0]["params"]["oid"] == "c1" and sent[0]["params"]["category"] == "BUDGET" \
+            and sent[0]["params"]["uid"] == "5"
+
+    def test_no_object_means_no_oid(self, monkeypatch):
+        calls = install(monkeypatch, pages([ev(2)]))
+        run()
+        assert "oid" not in activity_calls(calls)[0]["params"]
+
+    def test_events_for_other_objects_are_dropped_and_the_note_says_meta_did_not_filter(self, monkeypatch):
+        install(monkeypatch, pages([ev(3, obj="c1"), ev(2, obj="other"), ev(1, obj="other")]))
+        out = run(object_id="c1")
+        assert [e["object"]["id"] for e in out["events"]] == ["c1"]
+        assert "2 events for other objects" in out["notes"][0] and "did not apply the object filter" in out["notes"][0]
+
+    def test_if_meta_rejects_oid_it_is_dropped_and_the_scan_keeps_the_full_fields(self, monkeypatch):
+        seen = []
+        inner = pages([ev(i % 59, obj="c1" if i % 10 == 0 else "other") for i in range(250)])
 
         def handler(endpoint, p, fields):
-            if endpoint == "/c1/activities":
-                return MetaAPIError("(#100) Tried accessing nonexisting field (activities)", error_code=100)
+            seen.append(("oid" in p, list(fields)))
+            if "oid" in p:
+                return MetaAPIError("(#100) Invalid parameter oid", error_code=100)
             return inner(endpoint, p, fields)
 
-        calls = install(monkeypatch, handler)
+        install(monkeypatch, handler)
         out = run(object_id="c1", limit=100)
-        endpoints = [c["endpoint"] for c in activity_calls(calls)]
-        assert endpoints[0] == "/c1/activities" and "/act_1/activities" in endpoints
-        assert endpoints.index("/act_1/activities") > max(i for i, e in enumerate(endpoints) if e == "/c1/activities")
-        assert out["total"] == 25 and all(e["object"]["id"] == "c1" for e in out["events"])
-        assert "per-object history was not available" in out["notes"][0] and out["truncated"] is False
+        assert seen[0][0] is True and all(not with_oid for with_oid, _ in seen[1:])
+        assert all("actor_id" in f for _, f in seen)  # the rejection was about oid, so the fields were not downgraded
+        assert out["total"] == 25 and all(e["actor"]["id"] == "u1" and e["via"] == "Power Editor" and e["local_time"] for e in out["events"])
+        assert "did not accept its object filter" in out["notes"][0]
 
-    def test_a_category_or_user_filter_means_the_account_scan_not_the_object_edge(self, monkeypatch):
-        calls = install(monkeypatch, pages([ev(2, obj="c1"), ev(1, obj="other")]))
-        out = run(object_id="c1", category="budget")
-        assert [c["endpoint"] for c in activity_calls(calls)] == ["/act_1/activities"]
-        assert [e["object"]["id"] for e in out["events"]] == ["c1"]
+    def test_a_rejected_oid_is_not_retried_for_every_window(self, monkeypatch):
+        calls = install(monkeypatch, lambda e, p, f: MetaAPIError("(#100) bad", error_code=100) if "oid" in p else {"data": []})
+        run(object_id="c1", days=75)
+        assert sum(1 for c in activity_calls(calls) if "oid" in c["params"]) == 1
 
-    def test_the_scan_gives_up_at_its_cap_and_says_so(self, monkeypatch):
+    def test_if_the_fields_are_rejected_too_both_fallbacks_apply_in_order(self, monkeypatch):
+        seen = []
+
+        def handler(endpoint, p, fields):
+            seen.append(("oid" in p, "actor_id" in fields))
+            return MetaAPIError("(#100) bad", error_code=100) if ("oid" in p or "actor_id" in fields) else {"data": [ev(1, obj="c1")]}
+
+        install(monkeypatch, handler)
+        out = run(object_id="c1")
+        assert seen == [(True, True), (False, True), (False, False)] and out["total"] == 1
+
+    def test_the_scan_gives_up_at_its_cap_and_says_how_far_it_got(self, monkeypatch):
+        old = lambda: ev(1, obj="other", event_time="2026-09-30T10:00:00+0000")
+        always_more = lambda e, p, f: {"data": [old() for _ in range(100)], "paging": {"next": "x", "cursors": {"after": "c1"}}}
+        calls = install(monkeypatch, always_more)
+        out = run(object_id="c1", category="budget", days=30, limit=15)
+        assert out["total"] == 0 and out["truncated"] is True and len(activity_calls(calls)) == 10
+        assert out["window"]["searched_back_to"] == "2026-09-30T10:00:00+00:00" and out["window"]["events_read"] == 1000
+        assert "Read 1000 events back to 2026-09-30 and stopped" in out["notes"][-1]
+        assert "Raise limit" not in out["truncation_note"] and "read limit was reached" in out["truncation_note"]
+        assert "No changes found" not in out.get("note", "")
+
+    def test_a_capped_window_stops_the_read_instead_of_leaving_a_gap(self, monkeypatch):
         always_more = lambda e, p, f: {"data": [ev(1, obj="other") for _ in range(100)], "paging": {"next": "x", "cursors": {"after": "c1"}}}
         calls = install(monkeypatch, always_more)
-        out = run(object_id="c1", category="budget", limit=15)
-        assert out["total"] == 0 and out["truncated"] is True and len(activity_calls(calls)) == 10
+        out = run(object_id="c1", days=90)
+        assert len(activity_calls(calls)) == 10  # the newest 30-day window only; the older ones were not skipped into
+        assert out["truncated"] is True
+
+    def test_the_oldest_a_capped_scan_found_is_reported_with_the_events_it_did_find(self, monkeypatch):
+        rows = [ev(i % 59, obj="c1" if i == 0 else "other", event_time=f"2026-10-0{1 + i % 6}T10:00:00+0000") for i in range(100)]
+        always_more = lambda e, p, f: {"data": rows, "paging": {"next": "x", "cursors": {"after": "c1"}}}
+        install(monkeypatch, always_more)
+        out = run(object_id="c1", days=30, limit=50)
+        assert out["total"] == 10  # one per page, ten pages
+        assert out["window"]["searched_back_to"] == "2026-10-01T10:00:00+00:00"
+        assert "older changes were not searched" in out["notes"][-1]
 
     def test_event_type_filter_matches_the_type_or_its_translation_case_insensitively(self, monkeypatch):
         install(monkeypatch, pages([ev(1), ev(2, event_type="update_ad_set_run_status"), ev(3, event_type="ad_review_declined")]))

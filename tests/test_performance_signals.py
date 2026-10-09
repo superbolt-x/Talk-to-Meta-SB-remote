@@ -467,11 +467,13 @@ class TestTool:
             out = run(object_id="act_1", level="self", conversion_action_type=action, **kw)
             assert any(action in n and "not judged" in n for n in out.get("notes", [])), kw
             assert not [a for a in out["anomalies"] if a["metric"] in ("conversions", "cost_per_conversion")]
-        # asked for explicitly it stays listed, but the note explains why nothing was found
-        assert "conversions" in out["metrics_analyzed"]
-        # left to the defaults it is dropped, and the note is the only trace
+        # asked for explicitly or left to the defaults, a metric with nothing behind it is not listed as analyzed
+        # and has no empty trend line; `metrics_without_data` and the note say why
+        assert "conversions" not in out["metrics_analyzed"] and "cost_per_conversion" not in out["metrics_analyzed"]
+        assert set(out["metrics_without_data"]) == {"conversions", "cost_per_conversion"}
+        assert "conversions" not in out["trend"]["metrics"] and "cost_per_conversion" not in out["trend"]["metrics"]
         default = run(object_id="act_1", level="self", conversion_action_type=action)
-        assert "conversions" not in default["metrics_analyzed"]
+        assert "conversions" not in default["metrics_analyzed"] and "cost_per_conversion" not in default["trend"]["metrics"]
 
     def test_a_conversion_action_type_with_events_has_no_such_note(self, monkeypatch):
         install(monkeypatch, stable_days(BASELINE + RECENT, conversions=5.0))
@@ -483,11 +485,13 @@ class TestTool:
         out = run(object_id="act_1", level="self", metrics="leads,cpl,spend")
         note = next(n for n in out["notes"] if n.startswith("No data in the window for"))
         assert "leads" in note and "cpl" in note and "spend" not in note
+        assert out["metrics_analyzed"] == ["spend"] and out["metrics_without_data"] == ["leads", "cpl"]
 
     def test_default_metrics_without_data_stay_quiet(self, monkeypatch):
         install(monkeypatch, stable_days(BASELINE + RECENT, leads=0.0))
         out = run(object_id="act_1", level="self")
         assert not any(n.startswith("No data in the window") for n in out.get("notes", []))
+        assert "leads" not in out["metrics_analyzed"]
 
     def test_paged_entity_rows_are_followed(self, monkeypatch):
         pages = {}
