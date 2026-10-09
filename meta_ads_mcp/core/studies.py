@@ -408,25 +408,37 @@ def _objective_results(objective: dict, cell_names: dict[str, str], level: Optio
 
 def _study_currency(cells: list[dict], account_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """The currency of a lift study's `spend` (Meta gives none): the ad account the caller named, else the ad
-    accounts behind the first cell when they all agree. Returns (currency, why_not)."""
+    accounts of the first cell's campaigns or ad sets when they all agree. Returns (currency, why_not).
+
+    A cell's `ad_accounts` edge is in the SDK but Meta rejects it as a non-existing field, so it is not used."""
     if account_id:
         currency = get_account_currency(account_id)
         if currency:
             return currency, None
     if not cells:
         return None, "the study lists no cells"
-    try:
-        accounts, _, _ = _read(f"/{cells[0]['id']}/ad_accounts", ["id", "currency"], ["id"], {"limit": "10"})
-    except MetaAPIError as e:
-        return None, f"Meta would not list the first cell's ad accounts ({e})"
+    accounts: list[str] = []
+    problems: list[str] = []
+    for edge in ("campaigns", "ad_sets"):
+        try:
+            rows, _, _ = _read(f"/{cells[0]['id']}/{edge}", ["id", "account_id"], ["id"], {"limit": "25"})
+        except MetaAPIError as e:
+            problems.append(f"{edge.replace('_', ' ')}: {e}")
+            continue
+        accounts = sorted({ensure_account_id_format(str(r["account_id"])) for r in rows if r.get("account_id")})
+        if accounts:
+            break
     if not accounts:
-        return None, "Meta lists no ad accounts for the first cell"
-    currencies = {a.get("currency") for a in accounts if a.get("currency")}
-    if not currencies:
-        return None, "Meta returned no currency for the cell's ad accounts"
+        return None, ("Meta does not say which ad account the first cell belongs to"
+                      + (f" ({'; '.join(problems)})" if problems else ": it lists no campaigns or ad sets with an account"))
+    found = {a: get_account_currency(a) for a in accounts[:10]}
+    unknown = [a for a, c in found.items() if not c]
+    if unknown:
+        return None, f"could not read the currency of {', '.join(unknown)}"
+    currencies = sorted(set(found.values()))
     if len(currencies) > 1:
-        return None, f"its ad accounts use different currencies ({', '.join(sorted(currencies))})"
-    return currencies.pop(), None
+        return None, f"its ad accounts use different currencies ({', '.join(currencies)})"
+    return currencies[0], None
 
 
 def _cell_entities(cell_id: str) -> tuple[list[dict], list[dict], list[str], list[str]]:
