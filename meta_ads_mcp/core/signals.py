@@ -700,8 +700,7 @@ def get_performance_signals(
     window_agg = _aggregate(_window(object_days, all_dates))
     selected = requested or _default_metrics(archetype, conversion_action_type)
     no_data = [m for m in selected if not _has_data(m, window_agg)]
-    if not requested:
-        selected = [m for m in selected if m not in no_data]
+    selected = [m for m in selected if m not in no_data]  # nothing to judge, so no empty 0 -> 0 trend line either
 
     # A metric with nothing behind it is never judged; say so rather than let it pass as clean.
     data_notes: list[str] = []
@@ -812,6 +811,8 @@ def get_performance_signals(
         top, source = best_trend["message"], "trend"
 
     response["metrics_analyzed"] = selected
+    if no_data:
+        response["metrics_without_data"] = no_data
     response["summary"] = {
         "entities_analyzed": len(entities) - len(skipped),
         "entities_skipped": len(skipped),

@@ -170,9 +170,9 @@ class TestReasonsAndCaps:
         assert out["entities"][0]["id"] == "s-new"  # newest first
         assert "Showing the 5 most recently updated per level of 121" in out["entities_note"]
 
-    def test_the_default_list_is_25_per_level(self, monkeypatch):
+    def test_the_default_list_is_5_per_level(self, monkeypatch):
         self.legacy_account(monkeypatch)
-        assert run()["entities_shown"] == 25
+        assert run()["entities_shown"] == 5
 
     def test_zero_entities_means_just_the_summary(self, monkeypatch):
         self.legacy_account(monkeypatch)

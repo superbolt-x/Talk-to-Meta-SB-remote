@@ -86,7 +86,7 @@ Anomalies and trends computed from daily Insights ("anything unusual lately?", "
 - `top_n` (int, default 10, max 25): entities to scan, ranked by spend over the whole window.
 - `metrics` (str, optional): comma-separated subset of spend, impressions, ctr, cpm, cpc, frequency, purchases, cpa, roas, revenue, leads, cpl, conversions, cost_per_conversion. Default follows `archetype` and skips metrics with no data.
 - `archetype` (str, default 'hybrid'): 'ecommerce', 'lead_gen' or 'hybrid'.
-- `conversion_action_type` (str, optional): also analyze one specific action type (e.g. a custom conversion) as `conversions` / `cost_per_conversion`. If it has no events in the window (misspelled, or the conversion has not fired lately) a note says so; those metrics are not judged. Explicitly requested `metrics` with no data are named in a note too.
+- `conversion_action_type` (str, optional): also analyze one specific action type (e.g. a custom conversion) as `conversions` / `cost_per_conversion`. If it has no events in the window (misspelled, or the conversion has not fired lately) a note says so. Any metric with no data in the window, requested or default, is left out of `metrics_analyzed` and the trend, and listed in `metrics_without_data`; explicitly requested ones are named in a note too.
 - `include_daily` (bool, default false): add the object's daily series to `trend.daily`.
 - `min_spend_share` (float, default 0.005, 0-0.5): entities spending under this share of the scanned total over the baseline are skipped as too small to matter (0 disables). It does not apply to `level='self'`.
 
@@ -288,7 +288,7 @@ Campaigns, ad sets and ads Meta has flagged as not delivering properly: effectiv
 - `levels` (str, default 'campaign,adset,ad').
 - `statuses` (str, optional): effective statuses to treat as a problem.
 - `recent_days` (int, optional, 1-365): only entities updated in the last N days. Meta is asked to filter by update time; if it refuses, the filter is applied here and a note says so. Old accounts often carry hundreds of long-dead flagged entities, so this is the way to see what is wrong now.
-- `max_entities` (int, default 25, max 1000, 0 for none): entities listed per level, most recently updated first. The summary and reasons always cover every flagged entity.
+- `max_entities` (int, default 5, max 1000, 0 for none): entities listed per level, most recently updated first. The summary and reasons always cover every flagged entity.
 
 The answer leads with `scope` (`{"type": "account"|"campaign", "id": ...}`), `total`, `summary` (counts by level and status) and `reasons`: one entry per distinct problem with how many entities have it (counted once per entity), the levels, and three examples. Ad review feedback, which Meta repeats under `global` and every placement, is folded into `review_reasons` (policy, text, placements) and also counts as a `Review: <policy>` reason. `entities_note` says when the list was cut to `max_entities`. Up to 300 entities per level are read; a longer list is flagged `truncated`. A level that errors is reported under `errors` and never counted as clean.
 
