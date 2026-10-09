@@ -212,7 +212,7 @@ class TestLift:
             "/900/cells": {"data": [{"id": "c1", "name": "Test group", "treatment_percentage": 90, "control_percentage": 10}]},
             "/900/objectives": {"data": [{"id": "o1", "name": "Purchases", "type": "CONVERSIONS", "is_primary": True}]},
             "/o1": {"results": results, "last_updated_results": "2026-10-07"},
-            "/c1/campaigns": {"data": [{"id": "k1", "account_id": "7"}]}, "/c1/ad_sets": {"data": []},
+            "/c1/adaccounts": {"data": []}, "/c1/campaigns": {"data": [{"id": "k1", "account_id": "7"}]}, "/c1/adsets": {"data": []},
             "/act_7": {"currency": "USD"},
         }
 
@@ -277,7 +277,7 @@ class TestLiftReal:
             "/900/cells": {"data": [{"id": "c1", "name": "Test group", "treatment_percentage": 92, "control_percentage": 8}]},
             "/900/objectives": {"data": objectives or [{"id": "o1", "name": "Set", "type": "CONVERSIONS", "is_primary": True}]},
             "/o1": {"results": results, "last_updated_results": "2026-10-05"},
-            "/c1/campaigns": {"data": [{"id": "k1", "account_id": "7"}]}, "/c1/ad_sets": {"data": []},
+            "/c1/adaccounts": {"data": []}, "/c1/campaigns": {"data": [{"id": "k1", "account_id": "7"}]}, "/c1/adsets": {"data": []},
             "/act_7": {"currency": "USD"},
         }
         base.update(extra)
@@ -454,10 +454,10 @@ class TestLiftReal:
     def test_the_account_named_by_the_caller_gives_the_currency_without_asking_the_cells(self, monkeypatch):
         monkeypatch.setattr(studies, "get_account_currency", lambda account: "EUR" if account == "act_7" else None)
         routes = self.routes([json.dumps({"cell_id": "c1", "spend": 5})])
-        del routes["/c1/campaigns"], routes["/c1/ad_sets"]  # would fail the test if they were asked
+        del routes["/c1/adaccounts"], routes["/c1/campaigns"], routes["/c1/adsets"]  # would fail the test if they were asked
         calls = install(monkeypatch, routes)
         assert run_get(account_id="7")["units"]["spend"] == "EUR"
-        assert not any(c["endpoint"] in ("/c1/campaigns", "/c1/ad_sets") for c in calls)
+        assert not any(c["endpoint"].startswith("/c1/") and c["endpoint"].count("/") == 2 for c in calls)
 
     def test_an_account_whose_currency_is_unknown_falls_back_to_the_cells(self, monkeypatch):
         real = studies.get_account_currency
@@ -465,26 +465,51 @@ class TestLiftReal:
         install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})]))
         assert run_get(account_id="9")["units"]["spend"] == "USD"
 
-    def test_the_cells_ad_accounts_edge_is_not_asked_for_because_meta_rejects_it(self, monkeypatch):
-        """Seen live on Erie and Seed: (#100) Tried accessing nonexisting field (ad_accounts)."""
-        calls = install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})]))
+    def test_the_cells_edges_use_the_graph_names_without_underscores(self, monkeypatch):
+        """Seen live: (#100) nonexisting field (ad_sets) and (ad_accounts). The Graph edges are /adaccounts and /adsets;
+        ad_accounts and ad_sets are the SDK's method names."""
+        calls = install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{
+            "/c1/adaccounts": {"data": []}, "/c1/campaigns": {"data": []}, "/c1/adsets": {"data": [{"id": "s1", "account_id": "7"}]}}))
         run_get()
-        assert not any("ad_accounts" in c["endpoint"] for c in calls)
+        endpoints = [c["endpoint"] for c in calls if c["endpoint"].startswith("/c1/")]
+        assert endpoints == ["/c1/adaccounts", "/c1/campaigns", "/c1/adsets"]
+        assert not any("ad_accounts" in e or "ad_sets" in e for e in endpoints)
+
+    def test_the_cells_own_ad_accounts_give_the_currency_directly(self, monkeypatch):
+        calls = install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{
+            "/c1/adaccounts": {"data": [{"id": "act_7", "currency": "EUR"}]}}))
+        assert run_get()["units"]["spend"] == "EUR"
+        assert not any(c["endpoint"] in ("/c1/campaigns", "/c1/adsets", "/act_7") for c in calls)  # nothing else was needed
+
+    def test_ad_accounts_without_a_currency_are_looked_up(self, monkeypatch):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{
+            "/c1/adaccounts": {"data": [{"id": "act_7"}]}}))
+        assert run_get()["units"]["spend"] == "USD"
+
+    def test_cell_ad_accounts_with_two_currencies_are_not_guessed(self, monkeypatch):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{
+            "/c1/adaccounts": {"data": [{"id": "act_7", "currency": "USD"}, {"id": "act_8", "currency": "EUR"}]}}))
+        assert "different currencies (EUR, USD)" in run_get()["units"]["spend"]
+
+    def test_a_failing_ad_accounts_edge_moves_on_to_campaigns(self, monkeypatch):
+        install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{
+            "/c1/adaccounts": MetaAPIError("(#100) nonexisting field (adaccounts)", error_code=100)}))
+        assert run_get()["units"]["spend"] == "USD"
 
     def test_ad_sets_are_used_when_the_cell_has_no_campaigns(self, monkeypatch):
         install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{
-            "/c1/campaigns": {"data": []}, "/c1/ad_sets": {"data": [{"id": "s1", "account_id": "act_7"}]}}))
+            "/c1/campaigns": {"data": []}, "/c1/adsets": {"data": [{"id": "s1", "account_id": "act_7"}]}}))
         assert run_get()["units"]["spend"] == "USD"
 
     def test_campaigns_that_name_no_account_move_on_to_ad_sets(self, monkeypatch):
         install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{
-            "/c1/campaigns": {"data": [{"id": "k1"}]}, "/c1/ad_sets": {"data": [{"id": "s1", "account_id": "7"}]}}))
+            "/c1/campaigns": {"data": [{"id": "k1"}]}, "/c1/adsets": {"data": [{"id": "s1", "account_id": "7"}]}}))
         assert run_get()["units"]["spend"] == "USD"
 
     def test_a_campaigns_edge_that_fails_does_not_stop_the_ad_sets_attempt(self, monkeypatch):
         install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **{
             "/c1/campaigns": MetaAPIError("(#100) nonexisting field (campaigns)", error_code=100),
-            "/c1/ad_sets": {"data": [{"id": "s1", "account_id": "7"}]}}))
+            "/c1/adsets": {"data": [{"id": "s1", "account_id": "7"}]}}))
         assert run_get()["units"]["spend"] == "USD"  # the ad sets answered
 
     def test_the_same_account_written_two_ways_is_one_account(self, monkeypatch):
@@ -500,11 +525,12 @@ class TestLiftReal:
     @pytest.mark.parametrize("overrides,why", [
         ({"/c1/campaigns": {"data": [{"id": "k1", "account_id": "7"}, {"id": "k2", "account_id": "8"}]}, "/act_8": {"currency": "EUR"}},
          "different currencies (EUR, USD)"),
-        ({"/c1/campaigns": {"data": []}, "/c1/ad_sets": {"data": []}}, "lists no campaigns or ad sets with an account"),
+        ({"/c1/campaigns": {"data": []}, "/c1/adsets": {"data": []}}, "it lists no ad accounts, campaigns or ad sets"),
         ({"/act_7": MetaAPIError("(#200) denied", error_code=200)}, "could not read the currency of act_7"),
-        ({"/c1/campaigns": MetaAPIError("(#100) nonexisting field (campaigns)", error_code=100),
-          "/c1/ad_sets": MetaAPIError("(#100) nonexisting field (ad_sets)", error_code=100)},
-         "campaigns: (#100) nonexisting field (campaigns); ad sets: (#100) nonexisting field (ad_sets)"),
+        ({"/c1/adaccounts": MetaAPIError("(#100) nonexisting field (adaccounts)", error_code=100),
+          "/c1/campaigns": MetaAPIError("(#100) nonexisting field (campaigns)", error_code=100),
+          "/c1/adsets": MetaAPIError("(#100) nonexisting field (adsets)", error_code=100)},
+         "ad accounts: (#100) nonexisting field (adaccounts); campaigns: (#100) nonexisting field (campaigns); ad sets: (#100) nonexisting field (adsets)"),
     ])
     def test_when_the_currency_cannot_be_found_the_reason_is_given_and_nothing_is_guessed(self, monkeypatch, overrides, why):
         install(monkeypatch, self.routes([json.dumps({"cell_id": "c1", "spend": 5})], **overrides))
@@ -514,7 +540,7 @@ class TestLiftReal:
     def test_include_results_false_has_no_units_status_or_currency_call(self, monkeypatch):
         calls = install(monkeypatch, self.routes([]))
         out = run_get(include_results=False)
-        assert "units" not in out and "results_status" not in out and not any(c["endpoint"] in ("/c1/campaigns", "/c1/ad_sets", "/act_7") for c in calls)
+        assert "units" not in out and "results_status" not in out and not any(c["endpoint"] in ("/c1/adaccounts", "/c1/campaigns", "/c1/adsets", "/act_7") for c in calls)
 
 
 class TestHeaderFields:
@@ -592,9 +618,9 @@ class TestSplit:
             "/900/cells": {"data": [{"id": "c-a", "name": "Group A", "treatment_percentage": 50}, {"id": "c-b", "name": "Group B", "treatment_percentage": 50}]},
             "/900/objectives": {"data": []},
             "/c-a/campaigns": {"data": [{"id": "camp-a", "name": "Camp A", "account_id": "7"}]},
-            "/c-a/ad_sets": {"data": []},
+            "/c-a/adsets": {"data": []},
             "/c-b/campaigns": {"data": [{"id": "camp-b", "name": "Camp B", "account_id": "7"}]},
-            "/c-b/ad_sets": {"data": []},
+            "/c-b/adsets": {"data": []},
             "/act_7/insights": insights,
         }
         base.update(over)
@@ -631,9 +657,16 @@ class TestSplit:
         cmp_ = run_get()["performance_comparison"]
         assert cmp_["efficiency_metric"] is None and "ranking" not in cmp_
 
+    def test_a_cells_entities_are_read_from_the_graph_edges_campaigns_and_adsets(self, monkeypatch):
+        """Seen live on the currency lookup: /ad_sets is not an edge. A split test cell's are /campaigns and /adsets."""
+        calls = install(monkeypatch, self.routes())
+        run_get()
+        cell_calls = sorted(c["endpoint"] for c in calls if c["endpoint"].startswith("/c-a/"))
+        assert cell_calls == ["/c-a/adsets", "/c-a/campaigns"]
+
     def test_ad_sets_under_a_listed_campaign_are_not_counted_twice(self, monkeypatch):
         routes = self.routes()
-        routes["/c-a/ad_sets"] = {"data": [{"id": "as-1", "name": "Set", "campaign_id": "camp-a", "account_id": "7"}]}
+        routes["/c-a/adsets"] = {"data": [{"id": "as-1", "name": "Set", "campaign_id": "camp-a", "account_id": "7"}]}
         calls = install(monkeypatch, routes)
         out = run_get()
         assert out["cells"][0]["ad_set_count"] == 1 and out["cells"][0]["performance"]["spend"] == 1000
@@ -642,7 +675,7 @@ class TestSplit:
     def test_loose_ad_sets_are_read_at_ad_set_level(self, monkeypatch):
         routes = self.routes()
         routes["/c-a/campaigns"] = {"data": []}
-        routes["/c-a/ad_sets"] = {"data": [{"id": "as-1", "name": "Set", "campaign_id": "other", "account_id": "7"}]}
+        routes["/c-a/adsets"] = {"data": [{"id": "as-1", "name": "Set", "campaign_id": "other", "account_id": "7"}]}
         seen = []
 
         def insights(params, fields):
