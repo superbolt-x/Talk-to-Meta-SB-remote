@@ -209,6 +209,7 @@ def _merge_status_changes(events: list[dict]) -> list[dict]:
             frm, to = (starts[0] if starts else None), (ends[-1] if ends else None)
             if frm is not None and frm == to:
                 merged["change"] = None
+                merged["no_net_change"] = True
                 merged["note"] = f"Went through Pending Process and ended in the same state ({to}); no net change."
             else:
                 merged["change"] = {"from": frm, "to": to}
@@ -274,6 +275,7 @@ def get_activity_log(
     object_id: Optional[str] = None,
     event_type: Optional[str] = None,
     limit: int = 100,
+    include_status_blips: bool = False,
 ) -> dict:
     """
     Change history for an ad account: who changed what, and when (budget, status, bid, audience,
@@ -297,6 +299,9 @@ def get_activity_log(
         event_type: Only event types containing this text (e.g. 'budget', 'run_status', 'review').
         limit: Maximum events returned, 1-500 (default 100). `window.searched_back_to` says how far back the
             history was actually read; anything older was not looked at.
+        include_status_blips: Also list status round trips that ended where they began (Active, Pending
+            Process, Active). They show up whenever an object passes through Pending Process; they are hidden
+            by default, do not count against `limit`, and are counted in `summary.no_net_change_hidden`.
     """
     api_client._ensure_initialized()
     account_id = ensure_account_id_format(account_id)
@@ -324,6 +329,9 @@ def get_activity_log(
     if object_id:
         base_params["oid"] = object_id  # Meta filters on its side; the rows are checked again below
     client_filter = bool(wanted_type or object_id)
+
+    def shown(items: list[dict]) -> list[dict]:
+        return items if include_status_blips else [e for e in items if not e.get("no_net_change")]
     # A client-side filter has to read past rows it throws away, so it gets a bigger read budget.
     max_pages = MAX_RAW_PAGES if client_filter else -(-limit // PAGE_SIZE)
     currency = get_account_currency(account_id)
@@ -367,11 +375,12 @@ def get_activity_log(
             events.append(_normalize_event(raw, currency))
         events = _merge_status_changes(events)
         # Stop as soon as a window was not read to its start: carrying on to an older window would leave a gap.
-        if window_more or len(events) >= limit:
-            more = window_more or len(events) > limit or idx < len(windows) - 1
-            stopped = "cap" if (window_more and len(events) < limit) else "limit"
+        if window_more or len(shown(events)) >= limit:
+            more = window_more or len(shown(events)) > limit or idx < len(windows) - 1
+            stopped = "cap" if (window_more and len(shown(events)) < limit) else "limit"
             break
-    events = events[:limit]
+    hidden_blips = len(events) - len(shown(events))
+    events = shown(events)[:limit]
 
     if object_id and state["oid_rejected"]:
         notes.append("Meta did not accept its object filter, so the account's history was scanned and filtered here.")
@@ -410,7 +419,8 @@ def get_activity_log(
         "total": len(events),
         "summary": {"by_type": _top(by_type), "by_actor": _top(by_actor),
                     "newest": events[0]["time"] if events else None,
-                    "oldest": events[-1]["time"] if events else None},
+                    "oldest": events[-1]["time"] if events else None,
+                    **({"no_net_change_hidden": hidden_blips} if hidden_blips else {})},
         **truncation_fields({"next": "more"} if more else None, len(events), narrow_hint),
         "events": events,
         "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
