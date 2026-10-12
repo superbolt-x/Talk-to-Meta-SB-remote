@@ -133,6 +133,7 @@ from meta_ads_mcp.core import creatives  # noqa: E402, F401
 
 # --- Read Operations ---
 from meta_ads_mcp.core import insights  # noqa: E402, F401
+from meta_ads_mcp.core import video_retention  # noqa: E402, F401
 from meta_ads_mcp.core import opportunity  # noqa: E402, F401
 from meta_ads_mcp.core import signals  # noqa: E402, F401
 from meta_ads_mcp.core import activity  # noqa: E402, F401
