@@ -102,6 +102,26 @@ How a move gets flagged: it must be large (25% for rates and costs, 30% for spen
 
 Sensitivity is limited by volume, and that is by design: in simulation a 3-day window reliably catches a CPA doubling only at around 20 purchases/day (95%), about 1 in 3 at 6/day and rarely at 2/day, with false "worse" flags on 0-1% of unchanged campaigns. For low-volume campaigns use `recent_days=7` with a longer `baseline_days` (a 7-day window catches a halving at 6/day about 75% of the time).
 
+### get_video_retention [production-safe]
+Video retention and hook rate per ad. `get_insights` returns only the 3-second plays (`video_view`); this reads the rest of the video funnel from one Insights call at `level=ad`. Read-only.
+- `object_id` (str): Ad account ID, or a campaign / ad set ID to look inside it.
+- `time_range` (str, default 'last_7d'): Date preset or 'YYYY-MM-DD,YYYY-MM-DD'.
+- `level` (str, default 'ad'): Only 'ad' is supported.
+- `ad_name_contains` (str, optional): Keep ads whose name contains this text (case-insensitive).
+- `min_spend` (float, default 0): Drop ads that spent less than this over the range. Applied after merging.
+- `group_by` (str, default 'ad_name'): 'ad_name' merges ads that share a name inside a campaign, because one ad can carry two ad IDs (counts are summed, average watch time is weighted by plays). 'ad_id' keeps every ad ID apart.
+
+Per ad: `spend`, `impressions`, `plays` (all video plays), `plays_3s` (the `video_view` action), `p25`, `p50`, `p75`, `p95`, `p100`, `thruplay`, `avg_watch_time_s`, and `rates` in percent:
+- `hook_rate` = `plays_3s` / impressions
+- `retention_pX_vs_3s` = pX / `plays_3s`, and `retention_pX_vs_plays` = pX / `plays`, for X in 25, 50, 75, 95, 100. Both denominators are returned and named in `definitions`: say which one a chart uses.
+- `hold_rate` = `thruplay` / `plays_3s`
+
+A rate whose denominator is 0 is null. Static and GIF ads have no video fields in Insights, so every video field and `rates` are null (`is_video: false`), never 0. For an ad that does have video data, a field Meta omitted is reported as 0.
+
+`ordering_violations` lists any counts out of order against plays >= plays_3s >= p25 >= p50 >= p75 >= p95 >= p100 (empty when consistent). `plays_3s` below `p25` is expected for videos shorter than 12 seconds (25% of a 6-second video is 1.5 seconds), so a `p25>plays_3s` flag on a short video is not a data error.
+
+Video metrics are counted per impression, so attribution windows do not apply. The tool pages through up to 5,000 ad rows; past that, `truncated` is true with a note: query a campaign or ad set ID, or a shorter range. `ad_name_contains` filters after the rows are fetched.
+
 ## Phase v1.1 Wave 3 - Creative Reads (2 tools)
 
 ### get_ad_creatives [production-safe]

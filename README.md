@@ -12,6 +12,7 @@ KonQuest Meta Ads MCP uses an open-core model:
 - Image upload and retrieval
 - Campaign and ad set duplication
 - Insights and bulk cross-account analytics
+- Video retention and hook rate per ad (25/50/75/95/100% watched, ThruPlay, both retention denominators)
 - Opportunity score, recommendations and score history
 - Performance anomaly and trend signals (computed from daily Insights)
 - Pixel and tracking diagnostics, including Meta dataset quality / event match quality (6 tools)
