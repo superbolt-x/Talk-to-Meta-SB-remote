@@ -31,6 +31,12 @@ CORE_METRICS = [
     "website_purchase_roas",
 ]
 
+# Link-click metrics. Meta returns null `clicks`/`cpc`/`ctr` for some breakdowns
+# (e.g. user_segment_key), but inline link clicks still come back.
+LINK_CLICK_METRICS = [
+    "inline_link_clicks", "inline_link_click_ctr", "cost_per_inline_link_click",
+]
+
 # Extended metrics available on most objects
 EXTENDED_METRICS = CORE_METRICS + [
     "unique_clicks", "unique_ctr", "cost_per_unique_click",
@@ -207,6 +213,9 @@ def _normalize_metrics(
         "cpc": row.get("cpc"),
         "cpm": row.get("cpm"),
         "ctr": row.get("ctr"),
+        "link_clicks": row.get("inline_link_clicks"),
+        "link_ctr": row.get("inline_link_click_ctr"),
+        "cpc_link": row.get("cost_per_inline_link_click"),
         # Rankings
         "quality_ranking": row.get("quality_ranking"),
         "engagement_rate_ranking": row.get("engagement_rate_ranking"),
@@ -238,7 +247,11 @@ def _normalize_metrics(
     # Standardized higher-level keys
     # Purchases
     purchases = _extract_action_value(actions, "omni_purchase") or _extract_action_value(actions, "purchase")
-    if purchases:
+    if not purchases and archetype in ("ecommerce", "hybrid"):
+        # Report zero explicitly so breakdown segments with no purchases still show it
+        purchases = "0"
+        normalized["purchases"] = purchases
+    elif purchases:
         normalized["purchases"] = purchases
         cpa = _extract_action_cost(cost_per_action, "omni_purchase") or _extract_action_cost(cost_per_action, "purchase")
         if cpa:
@@ -406,6 +419,7 @@ def _build_compact_summary(normalized: dict, archetype: str = "hybrid") -> dict:
         "impressions": normalized.get("impressions"),
         "reach": normalized.get("reach"),
         "clicks": normalized.get("clicks"),
+        "link_clicks": normalized.get("link_clicks"),
         "ctr": normalized.get("ctr"),
         "cpc": normalized.get("cpc"),
         "cpm": normalized.get("cpm"),
@@ -485,9 +499,10 @@ def get_insights(
         breakdowns: Comma-separated breakdown dimensions (e.g. 'age,gender').
             Supported: age, gender, country, region, dma, impression_device,
             platform_position, publisher_platform, device_platform, product_id,
-            user_segment_key. user_segment_key splits results into new,
-            engaged and existing customers; Meta returns it only for
-            Advantage+ sales campaigns that have an existing-customer definition.
+            user_segment_key. user_segment_key splits results into
+            prospecting (shown as "New audience" in Ads Manager), engaged,
+            existing and unknown segments; clicks/ctr/cpc come back null for
+            it, so use link_clicks/link_ctr/cpc_link.
         level: Aggregation level when querying account/campaign: 'campaign', 'adset', 'ad'.
             Omit for object-level insights.
         archetype: Account archetype for metric selection: 'ecommerce', 'lead_gen',
@@ -546,6 +561,7 @@ def get_insights(
 
     # Select fields - add level-specific ID fields
     fields = list(CORE_METRICS)
+    fields.extend(LINK_CLICK_METRICS)
     fields.append("account_id")  # needed for custom conversion name resolution
     if level == "campaign":
         fields.extend(["campaign_id", "campaign_name"])
