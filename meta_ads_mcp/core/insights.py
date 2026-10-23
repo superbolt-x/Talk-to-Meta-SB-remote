@@ -93,7 +93,7 @@ ACTION_TYPES_BY_ARCHETYPE = {
 VALID_BREAKDOWNS = [
     "age", "gender", "country", "region", "dma",
     "impression_device", "platform_position", "publisher_platform",
-    "device_platform", "product_id",
+    "device_platform", "product_id", "user_segment_key",
 ]
 
 # Breakdown combinations that are NOT supported by Meta API
@@ -483,8 +483,11 @@ def get_insights(
         time_range: Date preset ('last_7d', 'last_30d', 'this_month', etc.)
             or explicit range 'YYYY-MM-DD,YYYY-MM-DD'.
         breakdowns: Comma-separated breakdown dimensions (e.g. 'age,gender').
-            Supported: age, gender, country, region, impression_device,
-            platform_position, publisher_platform, device_platform, product_id.
+            Supported: age, gender, country, region, dma, impression_device,
+            platform_position, publisher_platform, device_platform, product_id,
+            user_segment_key. user_segment_key splits results into new,
+            engaged and existing customers; Meta returns it only for
+            Advantage+ sales campaigns that have an existing-customer definition.
         level: Aggregation level when querying account/campaign: 'campaign', 'adset', 'ad'.
             Omit for object-level insights.
         archetype: Account archetype for metric selection: 'ecommerce', 'lead_gen',
