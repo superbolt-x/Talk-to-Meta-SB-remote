@@ -497,9 +497,18 @@ Upload a local video file to a Meta ad account for use in video ads.
 
 Validates file (exists, extension, size), uploads via simple upload (< 1GB), returns meta_video_id and initial processing state.
 
+### upload_video_from_url [supervised-only]
+Upload a video to a Meta ad account from a URL (e.g. an Air asset download URL, S3/GCS signed URL, CDN link). No local file needed.
+- `account_id` (str): Ad account ID.
+- `video_url` (str): Direct http(s) URL to the .mp4/.mov file. Must be downloadable without login; signed URLs must not be expired.
+- `title` (str, optional): Video title in Meta (defaults to filename in the URL).
+- `description` (str, optional): Video description.
+
+Passes the URL to Meta as `file_url` so Meta fetches the file itself (the video never transits the MCP server). Returns video_id and initial processing state; follow with poll_video_processing.
+
 ### poll_video_processing [production-safe]
 Poll video processing status until ready, failed, or max attempts.
-- `video_id` (str): Meta video ID from upload_video_asset.
+- `video_id` (str): Meta video ID from upload_video_asset or upload_video_from_url.
 - `max_attempts` (int, default 30): Max poll attempts.
 - `poll_interval_seconds` (int, default 10): Seconds between polls.
 

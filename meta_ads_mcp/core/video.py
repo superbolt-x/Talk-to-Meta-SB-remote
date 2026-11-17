@@ -1,7 +1,7 @@
 """
 Video upload and processing tools.
 
-Video-first workflow: upload local files, poll processing status,
+Video-first workflow: upload local files or URLs, poll processing status,
 and provide ready video_ids for manifest-driven ad creation.
 
 Processing state machine: uploaded -> processing -> ready | failed
@@ -193,23 +193,7 @@ def upload_video_asset(
         }
 
     # Step 4: Get initial processing status
-    processing_state = "uploaded"
-    try:
-        status_result = api_client.graph_get(
-            f"/{video_id}",
-            fields=["id", "title", "status", "length", "thumbnails", "created_time"],
-        )
-        video_status = status_result.get("status", {})
-        if isinstance(video_status, dict):
-            proc = video_status.get("processing_phase", {})
-            if proc.get("status") == "complete":
-                processing_state = "ready"
-            elif proc.get("status") == "error":
-                processing_state = "failed"
-            else:
-                processing_state = "processing"
-    except MetaAPIError:
-        processing_state = "unknown"
+    processing_state = _get_initial_processing_state(video_id)
 
     return {
         "video_id": video_id,
@@ -225,6 +209,162 @@ def upload_video_asset(
     }
 
 
+def _derive_title_from_url(video_url: str) -> str:
+    """Best-effort title from the last path segment of a URL (query/fragment stripped)."""
+    from urllib.parse import unquote, urlparse
+
+    path = urlparse(video_url).path
+    segment = unquote(path.rstrip("/").split("/")[-1]) if path else ""
+    stem = os.path.splitext(segment)[0].strip()
+    return stem or "Uploaded video"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False))
+def upload_video_from_url(
+    account_id: str,
+    video_url: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+) -> dict:
+    """
+    Upload a video to a Meta ad account from a URL (no local file needed).
+
+    Passes the URL to Meta's advideos endpoint as `file_url`, so Meta pulls
+    the file directly - the video never transits this server. Use this for
+    videos hosted in a DAM such as Air (pass the asset's download URL),
+    Google Drive direct links, S3/GCS signed URLs, CDNs, etc.
+
+    The URL must be directly downloadable by Meta without login or cookies
+    (a signed/expiring URL is fine as long as it is still valid when called).
+    Use a direct file link, not an HTML preview/share page.
+
+    The video enters processing after upload - use poll_video_processing
+    with the returned video_id to wait until it is ready for ad creation.
+
+    Args:
+        account_id: Ad account ID (e.g., 'act_123456789').
+        video_url: Public or signed http(s) URL to the video file (.mp4 or .mov).
+        title: Optional title for the video in Meta. Defaults to the filename in the URL.
+        description: Optional description.
+    """
+    # Step 1: Validate input
+    if not video_url or not video_url.strip():
+        return {
+            "error": "video_url is empty. Provide a direct, publicly downloadable video URL.",
+            "blocked_at": "input_validation",
+        }
+
+    video_url = video_url.strip()
+
+    if not (video_url.startswith("http://") or video_url.startswith("https://")):
+        return {
+            "error": f"video_url must start with http:// or https://. Got: '{video_url[:50]}'",
+            "blocked_at": "input_validation",
+        }
+
+    account_id = ensure_account_id_format(account_id)
+    video_title = title or _derive_title_from_url(video_url)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rollback_ref = f"upload_video_url_{account_id}_{timestamp.replace(' ', '_').replace(':', '')}"
+
+    # Step 2: Ask Meta to fetch the file from the URL
+    api_client._ensure_initialized()
+    upload_url = f"{GRAPH_API_BASE}/{account_id}/advideos"
+    data = {
+        "access_token": api_client._access_token,
+        "file_url": video_url,
+        "title": video_title,
+    }
+    if description:
+        data["description"] = description
+
+    try:
+        # Meta downloads the file synchronously before responding, so allow
+        # a generous timeout for large files.
+        with httpx.Client(timeout=600.0) as upload_client:
+            response = upload_client.post(upload_url, data=data)
+    except httpx.TimeoutException:
+        return {
+            "error": "Upload timed out after 600 seconds while Meta was fetching the video URL. "
+                     "The video may still appear in the ad account's media library; check before retrying.",
+            "video_url": video_url,
+            "blocked_at": "upload_timeout",
+            "rollback_reference": rollback_ref,
+        }
+    except httpx.RequestError as e:
+        return {
+            "error": f"Request to Meta failed: {e}",
+            "video_url": video_url,
+            "blocked_at": "api_upload",
+        }
+
+    api_client.rate_limits.update_from_headers(dict(response.headers))
+
+    if response.status_code != 200:
+        try:
+            error_detail = response.json().get("error", {}).get("message", response.text[:500])
+        except Exception:
+            error_detail = response.text[:500]
+        return {
+            "error": f"Upload failed (HTTP {response.status_code}): {error_detail}",
+            "video_url": video_url,
+            "blocked_at": "api_upload",
+            "hint": "Make sure the URL is a direct file download reachable without login "
+                    "and has not expired (signed URLs from Air/S3 expire).",
+            "rollback_reference": rollback_ref,
+        }
+
+    try:
+        result = response.json()
+    except ValueError:
+        return {
+            "error": "Meta returned a non-JSON response.",
+            "api_response": response.text[:500],
+            "blocked_at": "api_response",
+        }
+
+    video_id = result.get("id")
+    if not video_id:
+        return {
+            "error": "Upload returned no video ID.",
+            "api_response": result,
+            "blocked_at": "api_response",
+        }
+
+    # Step 3: Initial processing status
+    processing_state = _get_initial_processing_state(video_id)
+
+    return {
+        "video_id": video_id,
+        "upload_status": "success",
+        "processing_state": processing_state,
+        "source_url": video_url,
+        "title": video_title,
+        "next_step": "Call poll_video_processing with this video_id until ready, then use it in ad creation.",
+        "rollback_reference": rollback_ref,
+        "rate_limit_usage_pct": api_client.rate_limits.max_usage_pct,
+    }
+
+
+def _get_initial_processing_state(video_id: str) -> str:
+    """Fetch a video's processing phase right after upload."""
+    try:
+        status_result = api_client.graph_get(
+            f"/{video_id}",
+            fields=["id", "title", "status", "length", "thumbnails", "created_time"],
+        )
+    except MetaAPIError:
+        return "unknown"
+    video_status = status_result.get("status", {})
+    if isinstance(video_status, dict):
+        proc = video_status.get("processing_phase", {})
+        if proc.get("status") == "complete":
+            return "ready"
+        if proc.get("status") == "error":
+            return "failed"
+    return "processing"
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def poll_video_processing(
     video_id: str,
@@ -235,7 +375,7 @@ def poll_video_processing(
     Poll video processing status until ready, failed, or max attempts reached.
 
     Args:
-        video_id: Meta video ID from upload_video_asset.
+        video_id: Meta video ID from upload_video_asset or upload_video_from_url.
         max_attempts: Maximum poll attempts (default 30 = 5 minutes at 10s interval).
         poll_interval_seconds: Seconds between polls (default 10).
     """
